@@ -9,7 +9,8 @@
 # dashes) and linear/radial gradients into a non-premultiplied RGBA buffer.
 #
 # NOTE(port): the C memory pool (NSVGmemPage) and the active-edge freelist
-# are replaced by plain GC allocations; the algorithms are unchanged.
+# are replaced by flat primitive-array pools with integer links (see the
+# comments on @ae_* in Rasterizer); the algorithms are unchanged.
 
 require "./model"
 
@@ -24,16 +25,9 @@ module NanoSVG
   private PT_BEVEL  = 0x02u8
   private PT_LEFT   = 0x04u8
 
-  private class Edge
-    property x0 : Float32
-    property y0 : Float32
-    property x1 : Float32
-    property y1 : Float32
-    property dir : Int32
-
-    def initialize(@x0, @y0, @x1, @y1, @dir)
-    end
-  end
+  # Edge geometry is stored as parallel primitive arrays (structure of
+  # arrays): no per-edge allocations, and the hot loops touch raw memory.
+  # Populated by #add_edge, reset per shape/paint pass.
 
   private class RPoint
     property x : Float32
@@ -59,18 +53,6 @@ module NanoSVG
     end
   end
 
-  private class ActiveEdge
-    property x : Int32
-    property dx : Int32
-    property ey : Float32
-    property dir : Int32
-    property next : ActiveEdge?
-
-    def initialize(@x, @dx, @ey, @dir)
-      @next = nil
-    end
-  end
-
   private class CachedPaint
     property type : PaintType = PaintType::NONE
     property spread : SpreadType = SpreadType::PAD
@@ -84,11 +66,29 @@ module NanoSVG
     @tess_tol : Float32 = 0.25f32
     @dist_tol : Float32 = 0.01f32
 
-    @edges : Array(Edge) = [] of Edge
+    @e_x0  : Array(Float32) = Array(Float32).new(64, 0.0f32)
+    @e_y0  : Array(Float32) = Array(Float32).new(64, 0.0f32)
+    @e_x1  : Array(Float32) = Array(Float32).new(64, 0.0f32)
+    @e_y1  : Array(Float32) = Array(Float32).new(64, 0.0f32)
+    @e_dir : Array(Int32) = Array(Int32).new(64, 0)
+    # Order of edges sorted by y0, so the scan loop activates them via a
+    # moving index (mirrors the C qsort over the edge array).
+    @ord : Array(Int32) = Array(Int32).new(0)
     @points : Array(RPoint) = [] of RPoint
     @points2 : Array(RPoint) = [] of RPoint
 
-    @scanline : Array(UInt8) = [] of UInt8
+    @scanline : Bytes = Bytes.new(0)
+
+    # Active-edge pool: flat parallel primitive arrays with integer `next`
+    # links (index, -1 = end of list). Nodes are bump-allocated per pass from
+    # a pool sized to the edge count — each edge is activated at most once,
+    # so no freelist is needed (mirrors the C memory pool without GC
+    # allocations or nil checks in the scan loop).
+    @ae_x    : Array(Int32) = Array(Int32).new(0)
+    @ae_dx   : Array(Int32) = Array(Int32).new(0)
+    @ae_ey   : Array(Float32) = Array(Float32).new(0)
+    @ae_dir  : Array(Int32) = Array(Int32).new(0)
+    @ae_next : Array(Int32) = Array(Int32).new(0)
 
     @bitmap : Bytes = Bytes.new(0)
     @width : Int32 = 0
@@ -109,11 +109,12 @@ module NanoSVG
       @stride = stride
 
       if w > @scanline.size
-        @scanline = Array(UInt8).new(w, 0u8)
+        @scanline = Bytes.new(w)
       end
 
+      dst_ptr = dst.to_unsafe
       h.times do |i|
-        (i*stride ... i*stride + w*4).each { |k| dst[k] = 0u8 }
+        (dst_ptr + i*stride).clear(w*4)
       end
 
       image.shapes.each do |shape|
@@ -123,19 +124,9 @@ module NanoSVG
           paint_order = (shape.paint_order >> (2 * j)) & 0x03u8
 
           if paint_order == PAINT_FILL && shape.fill.type != PaintType::NONE
-            @edges.clear
+            clear_edges
             flatten_shape(shape, scale)
-
-            # Scale and translate edges
-            @edges.each do |e|
-              e.x0 = tx + e.x0
-              e.y0 = (ty + e.y0) * SUBSAMPLES
-              e.x1 = tx + e.x1
-              e.y1 = (ty + e.y1) * SUBSAMPLES
-            end
-
-            # Rasterize edges
-            @edges.sort! { |a, b| a.y0 < b.y0 ? -1 : (a.y0 > b.y0 ? 1 : 0) } unless @edges.empty?
+            prepare_edges(tx, ty)
 
             cache = CachedPaint.new
             init_paint(cache, shape.fill, shape.opacity)
@@ -143,18 +134,9 @@ module NanoSVG
           end
 
           if paint_order == PAINT_STROKE && shape.stroke.type != PaintType::NONE && (shape.stroke_width * scale) > 0.01f32
-            @edges.clear
+            clear_edges
             flatten_shape_stroke(shape, scale)
-
-            # Scale and translate edges
-            @edges.each do |e|
-              e.x0 = tx + e.x0
-              e.y0 = (ty + e.y0) * SUBSAMPLES
-              e.x1 = tx + e.x1
-              e.y1 = (ty + e.y1) * SUBSAMPLES
-            end
-
-            @edges.sort! { |a, b| a.y0 < b.y0 ? -1 : (a.y0 > b.y0 ? 1 : 0) } unless @edges.empty?
+            prepare_edges(tx, ty)
 
             cache = CachedPaint.new
             init_paint(cache, shape.stroke, shape.opacity)
@@ -220,10 +202,56 @@ module NanoSVG
       return if y0 == y1
 
       if y0 < y1
-        @edges << Edge.new(x0, y0, x1, y1, 1)
+        @e_x0 << x0
+        @e_y0 << y0
+        @e_x1 << x1
+        @e_y1 << y1
+        @e_dir << 1
       else
-        @edges << Edge.new(x1, y1, x0, y0, -1)
+        @e_x0 << x1
+        @e_y0 << y1
+        @e_x1 << x0
+        @e_y1 << y0
+        @e_dir << -1
       end
+    end
+
+    # Resets the edge arrays for a new pass (keeps capacity).
+    private def clear_edges : Nil
+      @e_x0.clear
+      @e_y0.clear
+      @e_x1.clear
+      @e_y1.clear
+      @e_dir.clear
+    end
+
+    # Scales/translates edges into screen space, then orders them by y0 so
+    # the scan loop can activate them with a moving index.
+    private def prepare_edges(tx : Float32, ty : Float32) : Nil
+      n = @e_x0.size
+      return if n == 0
+
+      x0p = @e_x0.to_unsafe
+      y0p = @e_y0.to_unsafe
+      x1p = @e_x1.to_unsafe
+      y1p = @e_y1.to_unsafe
+      i = 0
+      while i < n
+        x0p[i] = tx + x0p[i]
+        y0p[i] = (ty + y0p[i]) * SUBSAMPLES
+        x1p[i] = tx + x1p[i]
+        y1p[i] = (ty + y1p[i]) * SUBSAMPLES
+        i += 1
+      end
+
+      @ord = Array(Int32).new(n) { |k| k } if @ord.size < n
+      ord = @ord.to_unsafe
+      i = 0
+      while i < n
+        ord[i] = i
+        i += 1
+      end
+      Slice.new(@ord.to_unsafe, n).sort! { |a, b| y0p[a] < y0p[b] ? -1 : (y0p[a] > y0p[b] ? 1 : 0) }
     end
 
     private def normalize(x : Float32, y : Float32) : {Float32, Float32, Float32}
@@ -285,27 +313,30 @@ module NanoSVG
     private def flatten_shape(shape : Shape, scale : Float32)
       shape.paths.each do |path|
         @points.clear
-        # Flatten path
-        add_path_point(path.pts[0]*scale, path.pts[1]*scale, 0u8)
+        # Flatten path (raw pointer walk: no bounds checks on pts)
+        pts = path.pts.to_unsafe
+        add_path_point(pts[0]*scale, pts[1]*scale, 0u8)
         n = path.npts
         i = 0
         while i < n - 1
           p = i*2
           flatten_cubic_bez(
-            path.pts[p]*scale, path.pts[p+1]*scale,
-            path.pts[p+2]*scale, path.pts[p+3]*scale,
-            path.pts[p+4]*scale, path.pts[p+5]*scale,
-            path.pts[p+6]*scale, path.pts[p+7]*scale,
+            pts[p]*scale, pts[p+1]*scale,
+            pts[p+2]*scale, pts[p+3]*scale,
+            pts[p+4]*scale, pts[p+5]*scale,
+            pts[p+6]*scale, pts[p+7]*scale,
             0, 0u8)
           i += 3
         end
         # Close path
-        add_path_point(path.pts[0]*scale, path.pts[1]*scale, 0u8)
+        add_path_point(pts[0]*scale, pts[1]*scale, 0u8)
         # Build edges
-        j = @points.size - 1
+        pts_arr = @points.to_unsafe
+        m = @points.size
+        j = m - 1
         i = 0
-        while i < @points.size
-          add_edge(@points[j].x, @points[j].y, @points[i].x, @points[i].y)
+        while i < m
+          add_edge(pts_arr[j].x, pts_arr[j].y, pts_arr[i].x, pts_arr[i].y)
           j = i
           i += 1
         end
@@ -803,21 +834,9 @@ module NanoSVG
 
     # ---------- scanline rasterization ----------
 
-    private def add_active(e : Edge, start_point : Float32) : ActiveEdge
-      dxdy = (e.x1 - e.x0) / (e.y1 - e.y0)
-      # round dx down to avoid going too far
-      if dxdy < 0
-        dx = (-roundf(FIX.to_f32 * -dxdy)).to_i32
-      else
-        dx = roundf(FIX.to_f32 * dxdy).to_i32
-      end
-      x = roundf(FIX.to_f32 * (e.x0 + dxdy * (start_point - e.y0))).to_i32
-      ActiveEdge.new(x, dx, e.y1, e.dir)
-    end
-
-    private def fill_scanline(scanline : Array(UInt8), len : Int32, x0 : Int32, x1 : Int32,
-                              max_weight : Int32, mm : Array(Int32))
-      # mm = [xmin, xmax]
+    private def fill_scanline(sl : Pointer(UInt8), len : Int32, x0 : Int32, x1 : Int32,
+                              max_weight : Int32, mm : Pointer(Int32))
+      # mm points at [xmin, xmax]
       i = x0 >> FIXSHIFT
       j = x1 >> FIXSHIFT
       mm[0] = i if i < mm[0]
@@ -826,25 +845,25 @@ module NanoSVG
         if i == j
           # x0,x1 are the same pixel, so compute combined coverage
           v = ((x1 - x0) &* max_weight) >> FIXSHIFT
-          scanline[i] = scanline[i] &+ v.to_u8!
+          sl[i] = sl[i] &+ v.to_u8!
         else
           if i >= 0 # add antialiasing for x0
             v = ((FIX - (x0 & FIXMASK)) &* max_weight) >> FIXSHIFT
-            scanline[i] = scanline[i] &+ v.to_u8!
+            sl[i] = sl[i] &+ v.to_u8!
           else
             i = -1 # clip
           end
 
           if j < len # add antialiasing for x1
             v = ((x1 & FIXMASK) &* max_weight) >> FIXSHIFT
-            scanline[j] = scanline[j] &+ v.to_u8!
+            sl[j] = sl[j] &+ v.to_u8!
           else
             j = len # clip
           end
 
           k = i + 1
           while k < j # fill pixels between x0 and x1
-            scanline[k] = scanline[k] &+ max_weight.to_u8!
+            sl[k] = sl[k] &+ max_weight.to_u8!
             k += 1
           end
         end
@@ -854,40 +873,42 @@ module NanoSVG
     # note: this routine clips fills that extend off the edges... ideally this
     # wouldn't happen, but it could happen if the truetype glyph bounding boxes
     # are wrong, or if the user supplies a too-small bitmap
-    private def fill_active_edges(scanline : Array(UInt8), len : Int32, e : ActiveEdge?,
-                                  max_weight : Int32, mm : Array(Int32), fill_rule : FillRule)
+    private def fill_active_edges(sl : Pointer(UInt8), len : Int32, head : Int32,
+                                  ax : Pointer(Int32), adir : Pointer(Int32), anext : Pointer(Int32),
+                                  max_weight : Int32, mm : Pointer(Int32), nonzero : Bool)
       # non-zero winding fill
       x0 = 0
       w = 0
+      e = head
 
-      if fill_rule.nonzero?
+      if nonzero
         # Non-zero
-        while e
+        while e >= 0
           if w == 0
             # if we're currently at zero, we need to record the edge start point
-            x0 = e.not_nil!.x
-            w += e.not_nil!.dir
+            x0 = ax[e]
+            w += adir[e]
           else
-            x1 = e.not_nil!.x
-            w += e.not_nil!.dir
+            x1 = ax[e]
+            w += adir[e]
             # if we went to zero, we need to draw
-            fill_scanline(scanline, len, x0, x1, max_weight, mm) if w == 0
+            fill_scanline(sl, len, x0, x1, max_weight, mm) if w == 0
           end
-          e = e.not_nil!.next
+          e = anext[e]
         end
-      elsif fill_rule.evenodd?
+      else
         # Even-odd
-        while e
+        while e >= 0
           if w == 0
             # if we're currently at zero, we need to record the edge start point
-            x0 = e.not_nil!.x
+            x0 = ax[e]
             w = 1
           else
-            x1 = e.not_nil!.x
+            x1 = ax[e]
             w = 0
-            fill_scanline(scanline, len, x0, x1, max_weight, mm)
+            fill_scanline(sl, len, x0, x1, max_weight, mm)
           end
-          e = e.not_nil!.next
+          e = anext[e]
         end
       end
     end
@@ -923,9 +944,10 @@ module NanoSVG
       ((x.to_i32 &+ 1) &* 257) >> 16
     end
 
-    private def scanline_solid(dst : Bytes, d : Int32, count : Int32, cover : Array(UInt8),
-                               cover_off : Int32, x : Int32, y : Int32,
+    private def scanline_solid(dst : Bytes, d : Int32, count : Int32, cover : Pointer(UInt8),
+                               x : Int32, y : Int32,
                                tx : Float32, ty : Float32, scale : Float32, cache : CachedPaint)
+      dp = dst.to_unsafe + d
       if cache.type.color?
         cr = (cache.colors[0] & 0xff).to_i32
         cg = ((cache.colors[0] >> 8) & 0xff).to_i32
@@ -933,36 +955,27 @@ module NanoSVG
         ca = ((cache.colors[0] >> 24) & 0xff).to_i32
 
         count.times do
-          a = div255(cover[cover_off].to_i32 &* ca)
+          a = div255(cover.value.to_i32 &* ca)
           ia = 255 - a
-          # Premultiply
           r = div255(cr &* a)
           g = div255(cg &* a)
           b = div255(cb &* a)
-
-          # Blend over
-          r += div255(ia &* dst[d].to_i32)
-          g += div255(ia &* dst[d+1].to_i32)
-          b += div255(ia &* dst[d+2].to_i32)
-          a += div255(ia &* dst[d+3].to_i32)
-
-          dst[d] = r.to_u8!
-          dst[d+1] = g.to_u8!
-          dst[d+2] = b.to_u8!
-          dst[d+3] = a.to_u8!
-
-          cover_off += 1
-          d += 4
+          r += div255(ia &* dp[0].to_i32)
+          g += div255(ia &* dp[1].to_i32)
+          b += div255(ia &* dp[2].to_i32)
+          a += div255(ia &* dp[3].to_i32)
+          dp[0] = r.to_u8!
+          dp[1] = g.to_u8!
+          dp[2] = b.to_u8!
+          dp[3] = a.to_u8!
+          cover += 1
+          dp += 4
         end
       elsif cache.type.linear?
-        # TODO: spread modes.
-        # TODO: plenty of opportunities to optimize.
         t = cache.xform
-
         fx = (x.to_f32 - tx) / scale
         fy = (y.to_f32 - ty) / scale
         dx = 1.0f32 / scale
-
         count.times do
           gy = fx*t[1] + fy*t[3] + t[5]
           c = cache.colors[clampf(gy*255.0f32, 0.0f32, 255.0f32).to_i32]
@@ -970,40 +983,28 @@ module NanoSVG
           cg = ((c >> 8) & 0xff).to_i32
           cb = ((c >> 16) & 0xff).to_i32
           ca = ((c >> 24) & 0xff).to_i32
-
-          a = div255(cover[cover_off].to_i32 &* ca)
+          a = div255(cover.value.to_i32 &* ca)
           ia = 255 - a
-
-          # Premultiply
           r = div255(cr &* a)
           g = div255(cg &* a)
           b = div255(cb &* a)
-
-          # Blend over
-          r += div255(ia &* dst[d].to_i32)
-          g += div255(ia &* dst[d+1].to_i32)
-          b += div255(ia &* dst[d+2].to_i32)
-          a += div255(ia &* dst[d+3].to_i32)
-
-          dst[d] = r.to_u8!
-          dst[d+1] = g.to_u8!
-          dst[d+2] = b.to_u8!
-          dst[d+3] = a.to_u8!
-
-          cover_off += 1
-          d += 4
+          r += div255(ia &* dp[0].to_i32)
+          g += div255(ia &* dp[1].to_i32)
+          b += div255(ia &* dp[2].to_i32)
+          a += div255(ia &* dp[3].to_i32)
+          dp[0] = r.to_u8!
+          dp[1] = g.to_u8!
+          dp[2] = b.to_u8!
+          dp[3] = a.to_u8!
+          cover += 1
+          dp += 4
           fx += dx
         end
       elsif cache.type.radial?
-        # TODO: spread modes.
-        # TODO: plenty of opportunities to optimize.
-        # TODO: focus (fx,fy)
         t = cache.xform
-
         fx = (x.to_f32 - tx) / scale
         fy = (y.to_f32 - ty) / scale
         dx = 1.0f32 / scale
-
         count.times do
           gx = fx*t[0] + fy*t[2] + t[4]
           gy = fx*t[1] + fy*t[3] + t[5]
@@ -1013,28 +1014,21 @@ module NanoSVG
           cg = ((c >> 8) & 0xff).to_i32
           cb = ((c >> 16) & 0xff).to_i32
           ca = ((c >> 24) & 0xff).to_i32
-
-          a = div255(cover[cover_off].to_i32 &* ca)
+          a = div255(cover.value.to_i32 &* ca)
           ia = 255 - a
-
-          # Premultiply
           r = div255(cr &* a)
           g = div255(cg &* a)
           b = div255(cb &* a)
-
-          # Blend over
-          r += div255(ia &* dst[d].to_i32)
-          g += div255(ia &* dst[d+1].to_i32)
-          b += div255(ia &* dst[d+2].to_i32)
-          a += div255(ia &* dst[d+3].to_i32)
-
-          dst[d] = r.to_u8!
-          dst[d+1] = g.to_u8!
-          dst[d+2] = b.to_u8!
-          dst[d+3] = a.to_u8!
-
-          cover_off += 1
-          d += 4
+          r += div255(ia &* dp[0].to_i32)
+          g += div255(ia &* dp[1].to_i32)
+          b += div255(ia &* dp[2].to_i32)
+          a += div255(ia &* dp[3].to_i32)
+          dp[0] = r.to_u8!
+          dp[1] = g.to_u8!
+          dp[2] = b.to_u8!
+          dp[3] = a.to_u8!
+          cover += 1
+          dp += 4
           fx += dx
         end
       end
@@ -1042,15 +1036,43 @@ module NanoSVG
 
     private def rasterize_sorted_edges(tx : Float32, ty : Float32, scale : Float32,
                                        cache : CachedPaint, fill_rule : FillRule)
-      active : ActiveEdge? = nil
+      ne = @e_x0.size
+
+      # Grow the flat pools; they are reused across passes and shapes.
+      @ae_x    = Array(Int32).new(ne, 0) if @ae_x.size < ne
+      @ae_dx   = Array(Int32).new(ne, 0) if @ae_dx.size < ne
+      @ae_ey   = Array(Float32).new(ne, 0.0f32) if @ae_ey.size < ne
+      @ae_dir  = Array(Int32).new(ne, 0) if @ae_dir.size < ne
+      @ae_next = Array(Int32).new(ne, 0) if @ae_next.size < ne
+
+      ex0 = @e_x0.to_unsafe
+      ey0 = @e_y0.to_unsafe
+      ex1 = @e_x1.to_unsafe
+      ey1 = @e_y1.to_unsafe
+      edir = @e_dir.to_unsafe
+      ordp = @ord.to_unsafe
+
+      ax = @ae_x.to_unsafe
+      adx = @ae_dx.to_unsafe
+      aey = @ae_ey.to_unsafe
+      adir = @ae_dir.to_unsafe
+      anext = @ae_next.to_unsafe
+      count = 0 # bump allocator for active-edge nodes (each edge activated once)
+
+      active = -1 # head of the active-edge list (-1 = empty)
       e = 0
       max_weight = 255 // SUBSAMPLES # weight per vertical scanline
-      mm = [@width, 0] # [xmin, xmax]
+      mm = StaticArray(Int32, 2).new(0) # [xmin, xmax]
+      mmp = mm.to_unsafe
+      sl = @scanline.to_unsafe
+      nonzero = fill_rule.nonzero?
+      w = @width
+      h = @height
 
       y = 0
-      while y < @height
-        @width.times { |k| @scanline[k] = 0u8 }
-        mm[0] = @width
+      while y < h
+        sl.clear(w)
+        mm[0] = w
         mm[1] = 0
         s = 0
         while s < SUBSAMPLES
@@ -1059,104 +1081,115 @@ module NanoSVG
 
           # update all active edges;
           # remove all active edges that terminate before the center of this scanline
-          prev : ActiveEdge? = nil
+          prev = -1
           z = active
-          while z
-            zn = z.not_nil!
-            if zn.ey <= scany
+          while z >= 0
+            if aey[z] <= scany
               # delete from list
-              if prev
-                prev.not_nil!.next = zn.next
+              if prev >= 0
+                anext[prev] = anext[z]
               else
-                active = zn.next
+                active = anext[z]
               end
             else
-              zn.x += zn.dx # advance to position for current scanline
-              prev = zn
+              ax[z] += adx[z] # advance to position for current scanline
+              prev = z
             end
-            z = zn.next
+            z = anext[z]
           end
 
           # resort the list if needed
           loop do
             changed = false
-            prev = nil
+            prev = -1
             z = active
-            while z && z.not_nil!.next
-              zz = z.not_nil!
-              zn = zz.next.not_nil!
-              if zz.x > zn.x
-                zz.next = zn.next
-                zn.next = zz
-                if prev
-                  prev.not_nil!.next = zn
+            while z >= 0 && anext[z] >= 0
+              zn = anext[z]
+              if ax[z] > ax[zn]
+                anext[z] = anext[zn]
+                anext[zn] = z
+                if prev >= 0
+                  anext[prev] = zn
                 else
                   active = zn
                 end
                 changed = true
                 prev = zn
               else
-                prev = zz
+                prev = z
               end
-              z = prev.not_nil!.next
+              z = anext[prev]
             end
             break unless changed
           end
 
           # insert all edges that start before the center of this scanline -- omit ones that also end on this scanline
-          while e < @edges.size && @edges[e].y0 <= scany
-            if @edges[e].y1 > scany
-              ze = add_active(@edges[e], scany)
+          while e < ne && ey0[ordp[e]] <= scany
+            oe = ordp[e]
+            if ey1[oe] > scany
+              # add_active (inlined): fixed-point x and dx for this scanline
+              dxdy = (ex1[oe] - ex0[oe]) / (ey1[oe] - ey0[oe])
+              # round dx down to avoid going too far
+              if dxdy < 0
+                dx = (-roundf(FIX.to_f32 * -dxdy)).to_i32
+              else
+                dx = roundf(FIX.to_f32 * dxdy).to_i32
+              end
+              ze = count
+              count += 1
+              ax[ze] = roundf(FIX.to_f32 * (ex0[oe] + dxdy * (scany - ey0[oe]))).to_i32
+              adx[ze] = dx
+              aey[ze] = ey1[oe]
+              adir[ze] = edir[oe]
+              anext[ze] = -1
               # find insertion point
-              if active.nil?
+              if active < 0
                 active = ze
-              elsif ze.x < active.not_nil!.x
+              elsif ax[ze] < ax[active]
                 # insert at front
-                ze.next = active
+                anext[ze] = active
                 active = ze
               else
                 # find thing to insert AFTER
-                p = active.not_nil!
-                while p.next && p.next.not_nil!.x < ze.x
-                  p = p.next.not_nil!
+                p = active
+                while anext[p] >= 0 && ax[anext[p]] < ax[ze]
+                  p = anext[p]
                 end
-                # at this point, p->next->x is NOT < z->x
-                ze.next = p.next
-                p.next = ze
+                # at this point, anext[p] < 0 or ax[anext[p]] is NOT < ax[ze]
+                anext[ze] = anext[p]
+                anext[p] = ze
               end
             end
             e += 1
           end
 
           # now process all active edges in non-zero fashion
-          fill_active_edges(@scanline, @width, active, max_weight, mm, fill_rule) if active
+          fill_active_edges(sl, w, active, ax, adir, anext, max_weight, mmp, nonzero) if active >= 0
           s += 1
         end
         # Blit
         xmin = mm[0]
         xmax = mm[1]
         xmin = 0 if xmin < 0
-        xmax = @width - 1 if xmax > @width-1
+        xmax = w - 1 if xmax > w-1
         if xmin <= xmax
-          scanline_solid(@bitmap, y*@stride + xmin*4, xmax-xmin+1, @scanline, xmin, xmin, y, tx, ty, scale, cache)
+          scanline_solid(@bitmap, y*@stride + xmin*4, xmax-xmin+1, sl + xmin, xmin, y, tx, ty, scale, cache)
         end
         y += 1
       end
     end
 
     private def unpremultiply_alpha(image : Bytes, w : Int32, h : Int32, stride : Int32)
+      img = image.to_unsafe
       # Unpremultiply
       h.times do |y|
         w.times do |x|
           i = y*stride + x*4
-          r = image[i].to_i32
-          g = image[i+1].to_i32
-          b = image[i+2].to_i32
-          a = image[i+3].to_i32
+          a = img[i+3].to_i32
           if a != 0
-            image[i] = (r*255/a).to_u8!
-            image[i+1] = (g*255/a).to_u8!
-            image[i+2] = (b*255/a).to_u8!
+            img[i] = (img[i].to_i32*255//a).to_u8!
+            img[i+1] = (img[i+1].to_i32*255//a).to_u8!
+            img[i+2] = (img[i+2].to_i32*255//a).to_u8!
           end
         end
       end
@@ -1168,39 +1201,39 @@ module NanoSVG
           r = 0
           g = 0
           b = 0
-          a = image[i+3].to_i32
           n = 0
+          a = img[i+3].to_i32
           if a == 0
             # NOTE(port): the C code uses `x-1 > 0` and `y-1 > 0` (instead of
             # >= 0), so row/column 1 is never defringed — kept for fidelity.
-            if x-1 > 0 && image[i-1] != 0
-              r += image[i-4]
-              g += image[i-3]
-              b += image[i-2]
+            if x-1 > 0 && img[i-1] != 0
+              r += img[i-4]
+              g += img[i-3]
+              b += img[i-2]
               n += 1
             end
-            if x+1 < w && image[i+7] != 0
-              r += image[i+4]
-              g += image[i+5]
-              b += image[i+6]
+            if x+1 < w && img[i+7] != 0
+              r += img[i+4]
+              g += img[i+5]
+              b += img[i+6]
               n += 1
             end
-            if y-1 > 0 && image[i-stride+3] != 0
-              r += image[i-stride]
-              g += image[i-stride+1]
-              b += image[i-stride+2]
+            if y-1 > 0 && img[i-stride+3] != 0
+              r += img[i-stride]
+              g += img[i-stride+1]
+              b += img[i-stride+2]
               n += 1
             end
-            if y+1 < h && image[i+stride+3] != 0
-              r += image[i+stride]
-              g += image[i+stride+1]
-              b += image[i+stride+2]
+            if y+1 < h && img[i+stride+3] != 0
+              r += img[i+stride]
+              g += img[i+stride+1]
+              b += img[i+stride+2]
               n += 1
             end
             if n > 0
-              image[i] = (r//n).to_u8!
-              image[i+1] = (g//n).to_u8!
-              image[i+2] = (b//n).to_u8!
+              img[i] = (r//n).to_u8!
+              img[i+1] = (g//n).to_u8!
+              img[i+2] = (b//n).to_u8!
             end
           end
         end
