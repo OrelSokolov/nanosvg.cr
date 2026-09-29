@@ -29,7 +29,12 @@ module NanoSVG
   # arrays): no per-edge allocations, and the hot loops touch raw memory.
   # Populated by #add_edge, reset per shape/paint pass.
 
-  private class RPoint
+  # Flattened path point. A struct on purpose: Array(RPoint) stores the
+  # points inline (one flat C-like array, no per-point GC allocation).
+  # NOTE: being a value type, in-place mutation of array elements must go
+  # through a raw pointer (`(pts + i).value.field = v`); `pts[i].field = v`
+  # would silently mutate a temporary copy.
+  private struct RPoint
     property x : Float32
     property y : Float32
     property dx : Float32 = 0.0f32
@@ -178,10 +183,12 @@ module NanoSVG
     end
 
     private def add_path_point(x : Float32, y : Float32, flags : UInt8)
-      if !@points.empty?
-        pt = @points.last
-        if pt_equals?(pt.x, pt.y, x, y, @dist_tol)
-          pt.flags = pt.flags | flags
+      n = @points.size
+      if n > 0
+        pts = @points.to_unsafe
+        last = pts[n - 1]
+        if pt_equals?(last.x, last.y, x, y, @dist_tol)
+          (pts + n - 1).value.flags = last.flags | flags
           return
         end
       end
@@ -345,7 +352,12 @@ module NanoSVG
 
     # ---------- stroke ----------
 
-    private def init_closed(left : RPoint, right : RPoint, p0 : RPoint, p1 : RPoint, line_width : Float32)
+    # NOTE(port): in C, left/right are mutable NSVGpoint pointers owned by
+    # nsvg__expandStroke. Here the stroke outline accumulators are passed and
+    # returned as four Float32 values ({llx, lly, rrx, rry}), since RPoint is
+    # a value struct.
+
+    private def init_closed(p0 : RPoint, p1 : RPoint, line_width : Float32) : {Float32, Float32, Float32, Float32}
       w = line_width * 0.5f32
       dx = p1.x - p0.x
       dy = p1.y - p0.y
@@ -354,16 +366,13 @@ module NanoSVG
       py = p0.y + dy*len*0.5f32
       dlx = dy
       dly = -dx
-      left.x = px - dlx*w
-      left.y = py - dly*w
-      right.x = px + dlx*w
-      right.y = py + dly*w
+      {px - dlx*w, py - dly*w, px + dlx*w, py + dly*w}
     end
 
-    private def butt_cap(left : RPoint, right : RPoint, p : RPoint, dx : Float32, dy : Float32, line_width : Float32, connect : Bool)
+    private def butt_cap(llx : Float32, lly : Float32, rrx : Float32, rry : Float32,
+                         px : Float32, py : Float32, dx : Float32, dy : Float32,
+                         line_width : Float32, connect : Bool) : {Float32, Float32, Float32, Float32}
       w = line_width * 0.5f32
-      px = p.x
-      py = p.y
       dlx = dy
       dly = -dx
       lx = px - dlx*w
@@ -374,19 +383,18 @@ module NanoSVG
       add_edge(lx, ly, rx, ry)
 
       if connect
-        add_edge(left.x, left.y, lx, ly)
-        add_edge(rx, ry, right.x, right.y)
+        add_edge(llx, lly, lx, ly)
+        add_edge(rx, ry, rrx, rry)
       end
-      left.x = lx
-      left.y = ly
-      right.x = rx
-      right.y = ry
+      {lx, ly, rx, ry}
     end
 
-    private def square_cap(left : RPoint, right : RPoint, p : RPoint, dx : Float32, dy : Float32, line_width : Float32, connect : Bool)
+    private def square_cap(llx : Float32, lly : Float32, rrx : Float32, rry : Float32,
+                           px : Float32, py : Float32, dx : Float32, dy : Float32,
+                           line_width : Float32, connect : Bool) : {Float32, Float32, Float32, Float32}
       w = line_width * 0.5f32
-      px = p.x - dx*w
-      py = p.y - dy*w
+      px -= dx*w
+      py -= dy*w
       dlx = dy
       dly = -dx
       lx = px - dlx*w
@@ -397,19 +405,16 @@ module NanoSVG
       add_edge(lx, ly, rx, ry)
 
       if connect
-        add_edge(left.x, left.y, lx, ly)
-        add_edge(rx, ry, right.x, right.y)
+        add_edge(llx, lly, lx, ly)
+        add_edge(rx, ry, rrx, rry)
       end
-      left.x = lx
-      left.y = ly
-      right.x = rx
-      right.y = ry
+      {lx, ly, rx, ry}
     end
 
-    private def round_cap(left : RPoint, right : RPoint, p : RPoint, dx : Float32, dy : Float32, line_width : Float32, ncap : Int32, connect : Bool)
+    private def round_cap(llx : Float32, lly : Float32, rrx : Float32, rry : Float32,
+                          px : Float32, py : Float32, dx : Float32, dy : Float32,
+                          line_width : Float32, ncap : Int32, connect : Bool) : {Float32, Float32, Float32, Float32}
       w = line_width * 0.5f32
-      px = p.x
-      py = p.y
       dlx = dy
       dly = -dx
       lx = 0.0f32
@@ -441,17 +446,14 @@ module NanoSVG
       end
 
       if connect
-        add_edge(left.x, left.y, lx, ly)
-        add_edge(rx, ry, right.x, right.y)
+        add_edge(llx, lly, lx, ly)
+        add_edge(rx, ry, rrx, rry)
       end
-
-      left.x = lx
-      left.y = ly
-      right.x = rx
-      right.y = ry
+      {lx, ly, rx, ry}
     end
 
-    private def bevel_join(left : RPoint, right : RPoint, p0 : RPoint, p1 : RPoint, line_width : Float32)
+    private def bevel_join(llx : Float32, lly : Float32, rrx : Float32, rry : Float32,
+                           p0 : RPoint, p1 : RPoint, line_width : Float32) : {Float32, Float32, Float32, Float32}
       w = line_width * 0.5f32
       dlx0 = p0.dy
       dly0 = -p0.dx
@@ -466,19 +468,17 @@ module NanoSVG
       rx1 = p1.x + (dlx1 * w)
       ry1 = p1.y + (dly1 * w)
 
-      add_edge(lx0, ly0, left.x, left.y)
+      add_edge(lx0, ly0, llx, lly)
       add_edge(lx1, ly1, lx0, ly0)
 
-      add_edge(right.x, right.y, rx0, ry0)
+      add_edge(rrx, rry, rx0, ry0)
       add_edge(rx0, ry0, rx1, ry1)
 
-      left.x = lx1
-      left.y = ly1
-      right.x = rx1
-      right.y = ry1
+      {lx1, ly1, rx1, ry1}
     end
 
-    private def miter_join(left : RPoint, right : RPoint, p0 : RPoint, p1 : RPoint, line_width : Float32)
+    private def miter_join(llx : Float32, lly : Float32, rrx : Float32, rry : Float32,
+                           p0 : RPoint, p1 : RPoint, line_width : Float32) : {Float32, Float32, Float32, Float32}
       w = line_width * 0.5f32
       dlx0 = p0.dy
       dly0 = -p0.dx
@@ -488,34 +488,32 @@ module NanoSVG
       if (p1.flags & PT_LEFT) != 0
         lx0 = lx1 = p1.x - p1.dmx * w
         ly0 = ly1 = p1.y - p1.dmy * w
-        add_edge(lx1, ly1, left.x, left.y)
+        add_edge(lx1, ly1, llx, lly)
 
         rx0 = p1.x + (dlx0 * w)
         ry0 = p1.y + (dly0 * w)
         rx1 = p1.x + (dlx1 * w)
         ry1 = p1.y + (dly1 * w)
-        add_edge(right.x, right.y, rx0, ry0)
+        add_edge(rrx, rry, rx0, ry0)
         add_edge(rx0, ry0, rx1, ry1)
       else
         lx0 = p1.x - (dlx0 * w)
         ly0 = p1.y - (dly0 * w)
         lx1 = p1.x - (dlx1 * w)
         ly1 = p1.y - (dly1 * w)
-        add_edge(lx0, ly0, left.x, left.y)
+        add_edge(lx0, ly0, llx, lly)
         add_edge(lx1, ly1, lx0, ly0)
 
         rx0 = rx1 = p1.x + p1.dmx * w
         ry0 = ry1 = p1.y + p1.dmy * w
-        add_edge(right.x, right.y, rx1, ry1)
+        add_edge(rrx, rry, rx1, ry1)
       end
 
-      left.x = lx1
-      left.y = ly1
-      right.x = rx1
-      right.y = ry1
+      {lx1, ly1, rx1, ry1}
     end
 
-    private def round_join(left : RPoint, right : RPoint, p0 : RPoint, p1 : RPoint, line_width : Float32, ncap : Int32)
+    private def round_join(llx : Float32, lly : Float32, rrx : Float32, rry : Float32,
+                           p0 : RPoint, p1 : RPoint, line_width : Float32, ncap : Int32) : {Float32, Float32, Float32, Float32}
       w = line_width * 0.5f32
       dlx0 = p0.dy
       dly0 = -p0.dx
@@ -532,10 +530,10 @@ module NanoSVG
       n = 2 if n < 2
       n = ncap if n > ncap
 
-      lx = left.x
-      ly = left.y
-      rx = right.x
-      ry = right.y
+      lx = llx
+      ly = lly
+      rx = rrx
+      ry = rry
 
       n.times do |i|
         u = i.to_f32/(n-1).to_f32
@@ -556,26 +554,21 @@ module NanoSVG
         ry = ry1
       end
 
-      left.x = lx
-      left.y = ly
-      right.x = rx
-      right.y = ry
+      {lx, ly, rx, ry}
     end
 
-    private def straight_join(left : RPoint, right : RPoint, p1 : RPoint, line_width : Float32)
+    private def straight_join(llx : Float32, lly : Float32, rrx : Float32, rry : Float32,
+                              p1 : RPoint, line_width : Float32) : {Float32, Float32, Float32, Float32}
       w = line_width * 0.5f32
       lx = p1.x - (p1.dmx * w)
       ly = p1.y - (p1.dmy * w)
       rx = p1.x + (p1.dmx * w)
       ry = p1.y + (p1.dmy * w)
 
-      add_edge(lx, ly, left.x, left.y)
-      add_edge(right.x, right.y, rx, ry)
+      add_edge(lx, ly, llx, lly)
+      add_edge(rrx, rry, rx, ry)
 
-      left.x = lx
-      left.y = ly
-      right.x = rx
-      right.y = ry
+      {lx, ly, rx, ry}
     end
 
     private def curve_divs(r : Float32, arc : Float32, tol : Float32) : Int32
@@ -588,10 +581,9 @@ module NanoSVG
     private def expand_stroke(points : Array(RPoint), closed : Bool,
                               line_join : LineJoin, line_cap : LineCap, line_width : Float32)
       ncap = curve_divs(line_width*0.5f32, PI, @tess_tol) # divisions per half circle
-      left = RPoint.new
-      right = RPoint.new
-      first_left = RPoint.new
-      first_right = RPoint.new
+      llx = lly = rrx = rry = 0.0f32 # stroke outline accumulators (left/right)
+      fllx = flly = frrx = frry = 0.0f32
+      pts = points.to_unsafe
       npoints = points.size
 
       # Build stroke edges
@@ -610,37 +602,37 @@ module NanoSVG
       end
 
       if closed
-        init_closed(left, right, points[i0], points[i1], line_width)
-        first_left.x = left.x
-        first_left.y = left.y
-        first_right.x = right.x
-        first_right.y = right.y
+        llx, lly, rrx, rry = init_closed(pts[i0], pts[i1], line_width)
+        fllx = llx
+        flly = lly
+        frrx = rrx
+        frry = rry
       else
         # Add cap
-        p0 = points[i0]
-        p1 = points[i1]
+        p0 = pts[i0]
+        p1 = pts[i1]
         dx = p1.x - p0.x
         dy = p1.y - p0.y
         _, dx, dy = normalize(dx, dy)
-        butt_cap(left, right, p0, dx, dy, line_width, false) if line_cap.butt?
-        square_cap(left, right, p0, dx, dy, line_width, false) if line_cap.square?
-        round_cap(left, right, p0, dx, dy, line_width, ncap, false) if line_cap.round?
+        llx, lly, rrx, rry = butt_cap(llx, lly, rrx, rry, p0.x, p0.y, dx, dy, line_width, false) if line_cap.butt?
+        llx, lly, rrx, rry = square_cap(llx, lly, rrx, rry, p0.x, p0.y, dx, dy, line_width, false) if line_cap.square?
+        llx, lly, rrx, rry = round_cap(llx, lly, rrx, rry, p0.x, p0.y, dx, dy, line_width, ncap, false) if line_cap.round?
       end
 
       j = s_idx
       while j < e_idx
-        p0 = points[i0]
-        p1 = points[i1]
+        p0 = pts[i0]
+        p1 = pts[i1]
         if (p1.flags & PT_CORNER) != 0
           if line_join.round?
-            round_join(left, right, p0, p1, line_width, ncap)
+            llx, lly, rrx, rry = round_join(llx, lly, rrx, rry, p0, p1, line_width, ncap)
           elsif line_join.bevel? || (p1.flags & PT_BEVEL) != 0
-            bevel_join(left, right, p0, p1, line_width)
+            llx, lly, rrx, rry = bevel_join(llx, lly, rrx, rry, p0, p1, line_width)
           else
-            miter_join(left, right, p0, p1, line_width)
+            llx, lly, rrx, rry = miter_join(llx, lly, rrx, rry, p0, p1, line_width)
           end
         else
-          straight_join(left, right, p1, line_width)
+          llx, lly, rrx, rry = straight_join(llx, lly, rrx, rry, p1, line_width)
         end
         i0 = i1
         i1 += 1
@@ -649,33 +641,45 @@ module NanoSVG
 
       if closed
         # Loop it
-        add_edge(first_left.x, first_left.y, left.x, left.y)
-        add_edge(right.x, right.y, first_right.x, first_right.y)
+        add_edge(fllx, flly, llx, lly)
+        add_edge(rrx, rry, frrx, frry)
       else
-        # Add cap
-        p0 = points[i0]
-        p1 = points[i1]
+        # Add cap (left/right swapped vs the start cap)
+        p0 = pts[i0]
+        p1 = pts[i1]
         dx = p1.x - p0.x
         dy = p1.y - p0.y
         _, dx, dy = normalize(dx, dy)
-        butt_cap(right, left, p1, -dx, -dy, line_width, true) if line_cap.butt?
-        square_cap(right, left, p1, -dx, -dy, line_width, true) if line_cap.square?
-        round_cap(right, left, p1, -dx, -dy, line_width, ncap, true) if line_cap.round?
+        if line_cap.butt?
+          rrx, rry, llx, lly = butt_cap(rrx, rry, llx, lly, p1.x, p1.y, -dx, -dy, line_width, true)
+        end
+        if line_cap.square?
+          rrx, rry, llx, lly = square_cap(rrx, rry, llx, lly, p1.x, p1.y, -dx, -dy, line_width, true)
+        end
+        if line_cap.round?
+          rrx, rry, llx, lly = round_cap(rrx, rry, llx, lly, p1.x, p1.y, -dx, -dy, line_width, ncap, true)
+        end
       end
     end
 
     private def prepare_stroke(miter_limit : Float32, line_join : LineJoin)
       npoints = @points.size
+      # NOTE: RPoint is a value struct, so in-place mutation must go through
+      # a raw pointer (`pts[i].field = v` would silently mutate a copy).
+      pts = @points.to_unsafe
       # Calculate segment directions and lengths
       i0 = npoints - 1
       i1 = 0
       npoints.times do
-        p0 = @points[i0]
-        p1 = @points[i1]
+        p0 = pts[i0]
+        p1 = pts[i1]
         # Calculate segment direction and length
-        p0.dx = p1.x - p0.x
-        p0.dy = p1.y - p0.y
-        p0.len, p0.dx, p0.dy = normalize(p0.dx, p0.dy)
+        dx = p1.x - p0.x
+        dy = p1.y - p0.y
+        len, ndx, ndy = normalize(dx, dy)
+        (pts + i0).value.dx = ndx
+        (pts + i0).value.dy = ndy
+        (pts + i0).value.len = len
         # Advance
         i0 = i1
         i1 += 1
@@ -685,36 +689,44 @@ module NanoSVG
       i0 = npoints - 1
       i1 = 0
       npoints.times do
-        p0 = @points[i0]
-        p1 = @points[i1]
-        dlx0 = p0.dy
-        dly0 = -p0.dx
-        dlx1 = p1.dy
-        dly1 = -p1.dx
+        p0 = pts[i0]
+        p1 = pts[i1]
+        dx0 = p0.dx
+        dy0 = p0.dy
+        dx1 = p1.dx
+        dy1 = p1.dy
+        dlx0 = dy0
+        dly0 = -dx0
+        dlx1 = dy1
+        dly1 = -dx1
         # Calculate extrusions
-        p1.dmx = (dlx0 + dlx1) * 0.5f32
-        p1.dmy = (dly0 + dly1) * 0.5f32
-        dmr2 = p1.dmx*p1.dmx + p1.dmy*p1.dmy
+        dmx = (dlx0 + dlx1) * 0.5f32
+        dmy = (dly0 + dly1) * 0.5f32
+        dmr2 = dmx*dmx + dmy*dmy
         if dmr2 > 0.000001f32
           s2 = 1.0f32 / dmr2
           s2 = 600.0f32 if s2 > 600.0f32
-          p1.dmx *= s2
-          p1.dmy *= s2
+          dmx *= s2
+          dmy *= s2
         end
+        (pts + i1).value.dmx = dmx
+        (pts + i1).value.dmy = dmy
 
+        flags = p1.flags
         # Clear flags, but keep the corner.
-        p1.flags = (p1.flags & PT_CORNER) != 0 ? PT_CORNER : 0u8
+        flags = (flags & PT_CORNER) != 0 ? PT_CORNER : 0u8
 
         # Keep track of left turns.
-        cross = p1.dx * p0.dy - p0.dx * p1.dy
-        p1.flags |= PT_LEFT if cross > 0.0f32
+        cross = dx1 * dy0 - dx0 * dy1
+        flags |= PT_LEFT if cross > 0.0f32
 
         # Check to see if the corner needs to be beveled.
-        if (p1.flags & PT_CORNER) != 0
+        if (flags & PT_CORNER) != 0
           if (dmr2 * miter_limit*miter_limit) < 1.0f32 || line_join.bevel? || line_join.round?
-            p1.flags |= PT_BEVEL
+            flags |= PT_BEVEL
           end
         end
+        (pts + i1).value.flags = flags
 
         i0 = i1
         i1 += 1

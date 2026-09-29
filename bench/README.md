@@ -74,14 +74,19 @@ microseconds elsewhere); the parser was not the target here.
    indexing; the scanline is a `Bytes` cleared with `Pointer#clear`
    (memset).
 4. `flatten_shape` walks `path.pts` and `@points` via raw pointers.
+5. **RPoint is a value struct** stored inline in `Array(RPoint)` (flat
+   C-like array, no per-point GC allocation). Stroke outline accumulators
+   (`left`/`right` in C) became four Float32 values passed to and returned
+   from the cap/join helpers as tuples; `prepare_stroke` mutates points
+   through a raw pointer — with structs, `pts[i].field = v` would silently
+   mutate a temporary copy (Crystal semantics, verified by test).
 
 ## Remaining known costs
 
-- `RPoint` points are still heap classes (`flatten_cubic_bez` +
-  `add_path_point` ≈ 20% of rasterize time on 23.svg); converting them
-  to a structure-of-arrays requires auditing the stroke join/cap code
-  for reference aliasing (`left`/`right` mutations).
-- The parser (string handling, `String::Builder`) is ~1.5x off C.
+- `flatten_cubic_bez` + stroke flattening ≈ 20% of rasterize time on
+  23.svg; at w=128 (flatten-dominated) Crystal is still ~12% behind C,
+  at w≥512 it is at parity or faster.
+- The parser (string handling, `String::Builder`) is ~1.5–2x off C.
 
 ## Where the original gap came from
 
