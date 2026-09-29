@@ -1,0 +1,11 @@
+name: nanosvg
+version: 0.1.0
+
+authors:
+  - Oleg
+
+description: |
+  Pure Crystal port of NanoSVG: a simple SVG parser and rasterizer.
+  Parses SVG files into cubic bezier shapes and rasterizes them to RGBA.
+
+license: Zlib
