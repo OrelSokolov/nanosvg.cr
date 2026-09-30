@@ -7,3 +7,4 @@
 *.crystal
 shard.lock
 bench/build/
+/nanosvg

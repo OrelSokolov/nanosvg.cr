@@ -14,7 +14,7 @@ artwork it produces byte-identical output to the C library.
 ```yaml
 dependencies:
   nanosvg:
-    path: ../nanosvg.cr  # or your git remote
+    github: OrelSokolov/nanosvg.cr
 ```
 
 2. Run `shards install`
@@ -97,6 +97,6 @@ crystal run examples/render.cr -- example_data/23.svg out.png 512
 
 ## License
 
-zlib — same as the original NanoSVG (see `LICENSE` in the upstream repo).
+zlib — same as the original NanoSVG (see `LICENSE`).
 The polygon rasterization is based on the stb_truetype rasterizer by
 Sean Barrett.
