@@ -2,7 +2,7 @@ name: nanosvg
 version: 0.1.0
 
 authors:
-  - Oleg Orlov <vk.orelsokolov@yandex.by>
+  - Oleg Orlov <orelcokolov@gmail.com>
 
 description: |
   Pure Crystal port of NanoSVG: a simple SVG parser and rasterizer.
