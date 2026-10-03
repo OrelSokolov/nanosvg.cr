@@ -139,7 +139,7 @@ module NanoSVG
   end
 
   # Style attribute stack entry (C: NSVGattrib).
-  private class Attrib
+  class Attrib
     property id : String = ""
     property xform : Array(Float32) = [1.0f32, 0.0f32, 0.0f32, 1.0f32, 0.0f32, 0.0f32]
     property fill_color : UInt32 = 0u32
@@ -226,6 +226,7 @@ module NanoSVG
       p = Parser.new
       p.dpi = dpi
       p.parse_xml(input)
+      p.resolve_pending_uses
       # Create gradients after all definitions have been parsed
       p.create_gradients
       # Scale to viewBox
@@ -252,10 +253,27 @@ module NanoSVG
     @path_flag = false
     @defs_flag = false
     @style_flag = false
+    # id -> path templates collected from <defs> (local-space points),
+    # consumed by <use href="#id">.
+    @defs_templates = {} of String => Array(Path)
+    # <use> references that could not be resolved during parsing
+    # (forward references); resolved after the whole document is read.
+    @pending_uses = [] of PendingUse
+    @svg_depth = 0
 
     def initialize
       @image = Image.new
       @attr = Array(Attrib).new(MAX_ATTR) { Attrib.new }
+    end
+
+    # A <use> that referenced an id not seen yet.
+    private class PendingUse
+      property href : String
+      property xform : Array(Float32)
+      property attr : Attrib
+
+      def initialize(@href, @xform, @attr)
+      end
     end
 
     # ---------- byte-level helpers (C operated on char*) ----------
@@ -646,7 +664,14 @@ module NanoSVG
     private def add_shape
       return if @plist.empty?
 
-      attr = get_attr
+      shape = build_shape(get_attr, @plist)
+      @plist = [] of Path
+      @image.shapes << shape
+    end
+
+    # Builds a shape from already-transformed paths and attribute state.
+    # Shared by element parsing and <use> instantiation.
+    private def build_shape(attr : Attrib, paths : Array(Path)) : Shape
       shape = Shape.new
 
       shape.id = attr.id
@@ -667,15 +692,14 @@ module NanoSVG
       shape.opacity = attr.opacity
       shape.paint_order = attr.paint_order
 
-      shape.paths = @plist
-      @plist = [] of Path
+      shape.paths = paths
 
       # Calculate shape bounds
-      shape.bounds[0] = shape.paths[0].bounds[0]
-      shape.bounds[1] = shape.paths[0].bounds[1]
-      shape.bounds[2] = shape.paths[0].bounds[2]
-      shape.bounds[3] = shape.paths[0].bounds[3]
-      shape.paths.skip(1).each do |path|
+      shape.bounds[0] = paths[0].bounds[0]
+      shape.bounds[1] = paths[0].bounds[1]
+      shape.bounds[2] = paths[0].bounds[2]
+      shape.bounds[3] = paths[0].bounds[3]
+      paths.skip(1).each do |path|
         shape.bounds[0] = minf(shape.bounds[0], path.bounds[0])
         shape.bounds[1] = minf(shape.bounds[1], path.bounds[1])
         shape.bounds[2] = maxf(shape.bounds[2], path.bounds[2])
@@ -707,7 +731,7 @@ module NanoSVG
       # Set flags
       shape.flags = attr.visible ? FLAGS_VISIBLE : 0x00u8
 
-      @image.shapes << shape
+      shape
     end
 
     private def add_path(closed : Bool)
@@ -730,7 +754,14 @@ module NanoSVG
         i += 2
       end
 
-      # Find bounds
+      compute_path_bounds(path)
+
+      @plist.unshift(path)
+    end
+
+    # Tight bounds of a transformed path (convex hull of bezier control
+    # points plus curve inflection points, as in add_path).
+    private def compute_path_bounds(path : Path)
       b = Array(Float32).new(4, 0.0f32)
       n = path.npts
       i = 0
@@ -746,8 +777,21 @@ module NanoSVG
         end
         i += 3
       end
+    end
 
-      @plist.unshift(path)
+    # Copies a template path into a new coordinate system (<use>).
+    private def transformed_path(tpl : Path, xform : Array(Float32)) : Path
+      p = Path.new
+      p.closed = tpl.closed
+      i = 0
+      while i < tpl.pts.size
+        x, y = xform_point(tpl.pts[i], tpl.pts[i+1], xform)
+        p.pts << x
+        p.pts << y
+        i += 2
+      end
+      compute_path_bounds(p)
+      p
     end
 
     # ---------- number parsing ----------
@@ -1796,16 +1840,26 @@ module NanoSVG
       end
 
       unless d.empty?
-        reset_path
-        cur = PathCursor.new
-        args = Array(Float32).new(10, 0.0f32)
-        cmd : Char? = nil
-        nargs = 0
-        rargs = 0
-        closed_flag = false
+        run_path_commands(d)
+      end
 
-        s = d
-        i = 0
+      add_shape
+    end
+
+    # Runs the path command loop over a `d` string, appending finished
+    # subpaths to @plist (in the current attribute xform). Shared by
+    # <path> elements and <defs> path templates.
+    private def run_path_commands(d : String)
+      reset_path
+      cur = PathCursor.new
+      args = Array(Float32).new(10, 0.0f32)
+      cmd : Char? = nil
+      nargs = 0
+      rargs = 0
+      closed_flag = false
+
+      s = d
+      i = 0
         while i < s.bytesize
           item = ""
           if (cmd == 'A' || cmd == 'a') && (nargs == 3 || nargs == 4)
@@ -1905,11 +1959,8 @@ module NanoSVG
             end
           end
         end
-        # Commit path.
-        add_path(closed_flag) if npts > 0
-      end
-
-      add_shape
+      # Commit path.
+      add_path(closed_flag) if npts > 0
     end
 
     private def parse_rect(attrs : Array(Tuple(String, String)))
@@ -2146,6 +2197,149 @@ module NanoSVG
       end
     end
 
+    # Parses a viewBox attribute ("minx miny w h").
+    private def parse_view_box(value : String) : {Float32, Float32, Float32, Float32}?
+      s = value
+      i = 0
+      vals = Array(Float32).new(4, 0.0f32)
+      4.times do |k|
+        while ch(s, i) != 0 && (ws?(ch(s, i)) || ch(s, i) == 44)
+          i += 1
+        end
+        return nil if ch(s, i) == 0
+        i, buf = parse_number(s, i)
+        vals[k] = atof(buf).to_f32
+      end
+      {vals[0], vals[1], vals[2], vals[3]}
+    end
+
+    # Nested <svg x= y= width= height= viewBox=>: establishes a new
+    # viewport, which is a plain transform on the attribute stack:
+    # translate(x,y) * scale(w/vbw, h/vbh) * translate(-minx,-miny).
+    # (MathJax uses this to stretchy-scale delimiters.) The implicit
+    # clipping of nested viewports is not applied.
+    private def parse_nested_svg(attrs : Array(Tuple(String, String)))
+      x = 0.0f32
+      y = 0.0f32
+      w = 0.0f32
+      h = 0.0f32
+      vb : {Float32, Float32, Float32, Float32}? = nil
+
+      # Push first: presentation attributes on the nested <svg> inherit
+      # to its subtree only.
+      push_attr
+      attrs.each do |name, value|
+        case name
+        when "x"      then x = parse_coordinate(value, 0.0f32, 0.0f32)
+        when "y"      then y = parse_coordinate(value, 0.0f32, 0.0f32)
+        when "width"  then w = parse_coordinate(value, 0.0f32, 0.0f32)
+        when "height" then h = parse_coordinate(value, 0.0f32, 0.0f32)
+        when "viewBox" then vb = parse_view_box(value)
+        else
+          parse_attr(name, value)
+        end
+      end
+
+      # xform_multiply(t, s) applies t to the point first, then s: build
+      # the chain translate(-minx,-miny) -> scale(w/vbw, h/vbh) -> translate(x,y).
+      if v = vb
+        sx = v[2] > 0.0f32 && w > 0.0f32 ? w / v[2] : 1.0f32
+        sy = v[3] > 0.0f32 && h > 0.0f32 ? h / v[3] : 1.0f32
+        local = xform_translation(-v[0], -v[1])
+        local = xform_multiply(local, xform_scale(sx, sy))
+        local = xform_multiply(local, xform_translation(x, y))
+      else
+        local = xform_translation(x, y)
+      end
+
+      # The viewport transform applies to the element's local
+      # coordinates before the accumulated (parent) chain, like an
+      # element's own transform attribute.
+      attr = get_attr
+      attr.xform = xform_premultiply(attr.xform, local)
+    end
+
+    # <path id="..."> inside <defs>: stored as a local-space template,
+    # not emitted. The template keeps the element's own coordinates so
+    # each <use> can place it in its own coordinate system.
+    private def parse_def_path(attrs : Array(Tuple(String, String)))
+      d = ""
+      id = ""
+      attrs.each do |name, value|
+        if name == "d"
+          d = value
+        elsif name == "id"
+          id = value
+        end
+      end
+      return if d.empty? || id.empty?
+
+      saved_xform = get_attr.xform.dup
+      get_attr.xform = xform_identity
+      run_path_commands(d)
+      get_attr.xform = saved_xform
+
+      @defs_templates[id] = @plist.map(&.dup) unless @plist.empty?
+      @plist = [] of Path
+    end
+
+    # <use href="#id" x= y=>: instantiates the referenced defs path
+    # template with the current (inherited) paint and the accumulated
+    # transform, plus the x/y translation applied after the transform.
+    private def parse_use(attrs : Array(Tuple(String, String)))
+      href = ""
+      x = 0.0f32
+      y = 0.0f32
+
+      push_attr
+      attrs.each do |name, value|
+        case name
+        when "href", "xlink:href" then href = value
+        when "x" then x = parse_coordinate(value, 0.0f32, 0.0f32)
+        when "y" then y = parse_coordinate(value, 0.0f32, 0.0f32)
+        else
+          parse_attr(name, value)
+        end
+      end
+
+      href = href.byte_slice(1, href.bytesize - 1) if href.starts_with?('#')
+      unless href.empty?
+        # The x/y translation applies to the template's local coordinates
+        # before the accumulated (parent + own transform) chain, per spec.
+        xform = xform_premultiply(get_attr.xform, xform_translation(x, y))
+        if template = @defs_templates[href]?
+          emit_use_shape(template, xform, get_attr)
+        else
+          # Forward reference; resolve after the document is parsed.
+          @pending_uses << PendingUse.new(href, xform, get_attr.copy)
+        end
+      end
+      pop_attr
+    end
+
+    private def emit_use_shape(template : Array(Path), xform : Array(Float32), attr : Attrib)
+      paths = template.map { |tpl| transformed_path(tpl, xform) }
+      shape = build_shape(attr, paths)
+      # The use xform (state * translate(x,y)) is where the template was
+      # actually placed; build_shape recorded attr.xform (without the
+      # x/y translation), used only for gradient resolution.
+      shape.xform = xform.dup
+      @image.shapes << shape
+    end
+
+    # Instantiates deferred <use> references whose defs appeared later
+    # in the document. Unresolvable references are dropped silently.
+    def resolve_pending_uses : Nil
+      @pending_uses.reject! do |u|
+        if template = @defs_templates[u.href]?
+          emit_use_shape(template, u.xform, u.attr)
+          true
+        else
+          false
+        end
+      end
+    end
+
     private def parse_gradient(attrs : Array(Tuple(String, String)), type : PaintType)
       grad = GradientData.new(type)
 
@@ -2214,12 +2408,13 @@ module NanoSVG
 
     private def start_element(el : String, attrs : Array(Tuple(String, String)))
       if @defs_flag
-        # Skip everything but gradients and styles in defs
+        # Skip everything but gradients, styles and path templates in defs
         case el
         when "linearGradient" then parse_gradient(attrs, PaintType::LINEAR)
         when "radialGradient" then parse_gradient(attrs, PaintType::RADIAL)
         when "stop"           then parse_gradient_stop(attrs)
         when "style"          then @style_flag = true
+        when "path"           then parse_def_path(attrs)
         end
         return
       end
@@ -2265,8 +2460,15 @@ module NanoSVG
         parse_gradient_stop(attrs)
       when "defs"
         @defs_flag = true
+      when "use"
+        parse_use(attrs)
       when "svg"
-        parse_svg(attrs)
+        if @svg_depth == 0
+          parse_svg(attrs)
+        else
+          parse_nested_svg(attrs)
+        end
+        @svg_depth += 1
       when "style"
         @style_flag = true
       end
@@ -2278,6 +2480,9 @@ module NanoSVG
       when "path"  then @path_flag = false
       when "defs"  then @defs_flag = false
       when "style" then @style_flag = false
+      when "svg"
+        @svg_depth -= 1
+        pop_attr if @svg_depth > 0
       end
     end
 

@@ -54,6 +54,58 @@ describe NanoSVG::Parser do
     img.shapes[0].bounds[3].should be_close(50, 0.01)
   end
 
+  it "instantiates <use> from a defs path template with inherited paint" do
+    svg = <<-SVG
+      <svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+        <defs><path id="glyph" d="M 0 0 L 10 0 L 10 10 L 0 10 Z"/></defs>
+        <g fill="#00ff00" transform="translate(5,5)">
+          <use href="#glyph"/>
+          <use xlink:href="#glyph" transform="translate(20,0)"/>
+          <use href="#glyph" x="40" y="10"/>
+        </g>
+      </svg>
+    SVG
+    img = NanoSVG.parse(svg)
+    img.shapes.size.should eq(3)
+    img.shapes.each do |shape|
+      shape.fill.type.color?.should be_true
+      (shape.fill.color & 0xff).should eq(0)     # R
+      ((shape.fill.color >> 8) & 0xff).should eq(255) # G
+      shape.paths.size.should eq(1)
+    end
+    img.shapes[0].bounds.should eq([5.0, 5.0, 15.0, 15.0])
+    # transform on the use element
+    img.shapes[1].bounds.should eq([25.0, 5.0, 35.0, 15.0])
+    # x/y attributes translate after the accumulated transform
+    img.shapes[2].bounds.should eq([45.0, 15.0, 55.0, 25.0])
+  end
+
+  it "resolves forward <use> references after parsing" do
+    svg = %(<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><use href="#late"/><rect width="4" height="4"/><defs><path id="late" d="M 0 0 L 8 0 L 8 8 L 0 8 Z"/></defs></svg>)
+    img = NanoSVG.parse(svg)
+    img.shapes.size.should eq(2)
+    # rect first (document order), then the resolved use
+    img.shapes[1].bounds.should eq([0.0, 0.0, 8.0, 8.0])
+  end
+
+  it "treats a nested <svg> as a viewport transform" do
+    svg = <<-SVG
+      <svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" viewBox="0 0 100 100">
+        <svg x="10" y="20" width="50" height="25" viewBox="0 0 100 50">
+          <rect x="0" y="0" width="100" height="50" fill="black"/>
+        </svg>
+      </svg>
+    SVG
+    img = NanoSVG.parse(svg)
+    img.shapes.size.should eq(1)
+    b = img.shapes[0].bounds
+    # viewport scale 50/100 x 25/50, then translate(10,20)
+    b[0].should be_close(10, 0.01)
+    b[1].should be_close(20, 0.01)
+    b[2].should be_close(60, 0.01)
+    b[3].should be_close(45, 0.01)
+  end
+
   it "parses gradients with stops and resolves them late" do
     svg = <<-SVG
       <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">

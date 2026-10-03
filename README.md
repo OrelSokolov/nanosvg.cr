@@ -1,11 +1,15 @@
 # nanosvg.cr
 
-Pure Crystal port of [NanoSVG](https://github.com/memononen/nanosvg) by
-Mikko Mononen (zlib license): a simple SVG parser and rasterizer.
+Pure Crystal SVG parser and rasterizer, based on
+[NanoSVG](https://github.com/memononen/nanosvg) by Mikko Mononen
+(zlib license).
 
 Parses SVG files into a list of cubic bezier shapes and rasterizes them to
-an RGBA buffer. The port is faithful to the C original — on the test
-artwork it produces byte-identical output to the C library.
+an RGBA buffer. It started as a faithful port of the C library — on the
+test artwork it produces byte-identical output — and has since been
+extended beyond the C original: `<use>` with `<defs>` path templates,
+nested `<svg>` viewports, and MathJax-compatible rendering (see
+"Differences from C").
 
 ## Installation
 
@@ -59,9 +63,13 @@ crystal run examples/render.cr -- example_data/drawing.svg out.png 512
 
 ## Supported SVG features
 
-- Elements: `svg`, `g`, `path`, `rect`, `circle`, `ellipse`, `line`,
-  `polyline`, `polygon`, `defs`, `linearGradient`, `radialGradient`,
-  `stop`, `style` (simple `.class` selectors)
+- Elements: `svg` (root and nested — a nested `<svg>` acts as a viewport
+  transform, used by MathJax for stretchy delimiters), `g`, `path`, `rect`,
+  `circle`, `ellipse`, `line`, `polyline`, `polygon`, `defs`,
+  `linearGradient`, `radialGradient`, `stop`, `style` (simple `.class`
+  selectors), `use` (references a `<path id>` from `defs` via `href` /
+  `xlink:href`, with `x`/`y` and `transform`; forward references are
+  resolved after parsing — this is what MathJax SVG output is built on)
 - Path commands: all of `MmLlHhVvCcSsQqTtAaZz` (arcs are converted to
   cubic beziers)
 - Styles: presentation attributes, inline `style="..."`, CSS classes,
@@ -76,11 +84,30 @@ crystal run examples/render.cr -- example_data/drawing.svg out.png 512
 - Fill rules: nonzero and evenodd; anti-aliased scanline rasterization
   (5 sub-scanlines, 1/1024 fixed-point)
 
-Not supported (same as the C original): text, `use`/`symbol`, clip paths,
+Not supported (same as the C original): text, `use` referencing
+non-`path` elements, `symbol`, clip paths,
 masks, filters, patterns, markers, CSS cascade beyond simple classes.
+
+Known limitations of the `<use>`/nested-`<svg>` support:
+
+- A `transform` attribute on the `<path>` template inside `defs` is
+  ignored when the template is instantiated by `<use>` (MathJax output
+  does not use it).
+- `<use>` with a forward reference (the `defs` entry appears after the
+  `<use>` in the document) is resolved after parsing and appended to the
+  end of the shape list, so it paints on top rather than in document
+  order. Invisible with opaque glyphs; may matter for overlapping
+  semi-transparent shapes.
+- A nested `<svg>` with a `viewBox` but no `width`/`height` falls back
+  to scale 1 instead of the spec default (100% of the parent viewport),
+  and the implicit clipping of nested viewports is not applied.
 
 ## Differences from C
 
+- Extended beyond the C original: `<use href="#id">` referencing a
+  `<path id>` from `<defs>` (with `x`/`y`, `transform`, and forward
+  references), and nested `<svg>` elements treated as viewport
+  transforms — this is what MathJax SVG output is built on.
 - Colors use the same bit layout as C: `0xAABBGGRR` (R in the low byte).
 - The `NOTE(port)` comments in the sources mark deliberate deviations
   (mostly: C read uninitialized memory in degenerate cases; the port uses

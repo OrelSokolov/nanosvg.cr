@@ -28,6 +28,17 @@ crystal build --release -o bench/build/verify bench/verify.cr
 ./bench/build/verify example_data/*.svg
 ```
 
+## Corpus tools (MathJax validation)
+
+- `mathjax_corpus.cr` — checks parser output against the mathjax.cr
+  golden dataset (MathJax v3 SVG output): every file must yield exactly
+  count(`<use>`) + count(`<rect>`) visible shapes.
+- `render_corpus.cr` — batch-renders a directory of SVGs to PNGs
+  (currentColor resolved to black), mirroring the rsvg-convert oracle.
+- `render_matching.cr` — renders SVGs at exact pixel sizes from a
+  `name<TAB>w<TAB>h` manifest, for pixel-diffing against a reference
+  dataset rasterized by another renderer.
+
 ## Before optimization (rasterize, min, ms — C / Crystal)
 
 | file        | w=128        | w=512          | w=1024           |
