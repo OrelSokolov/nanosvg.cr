@@ -8,8 +8,9 @@ Parses SVG files into a list of cubic bezier shapes and rasterizes them to
 an RGBA buffer. It started as a faithful port of the C library — on the
 test artwork it produces byte-identical output — and has since been
 extended beyond the C original: `<use>` with `<defs>` path templates,
-nested `<svg>` viewports, and MathJax-compatible rendering (see
-"Differences from C").
+nested `<svg>` viewports, MathJax-compatible rendering (see
+"Differences from C"), and `<text>`/`<tspan>` rendering with real
+font outlines, advances and GPOS kerning (see "Text rendering").
 
 ## Installation
 
@@ -83,10 +84,17 @@ crystal run examples/render.cr -- example_data/drawing.svg out.png 512
 - `viewBox`, `preserveAspectRatio`, units (`px pt pc mm cm in em ex %`), DPI
 - Fill rules: nonzero and evenodd; anti-aliased scanline rasterization
   (5 sub-scanlines, 1/1024 fixed-point)
+- `text`/`tspan`: real glyph outlines from system TrueType fonts
+  (font-family/size/weight/style, fill/gradient/opacity/transform,
+  `text-anchor`, `dominant-baseline`, `letter-spacing`, `x`/`y`/`dx`/`dy`),
+  with hmtx advances and GPOS PairPos kerning (formats 1/2, incl.
+  extension lookups; legacy `kern` table as a fallback) — see
+  "Text rendering"
 
-Not supported (same as the C original): text, `use` referencing
-non-`path` elements, `symbol`, clip paths,
-masks, filters, patterns, markers, CSS cascade beyond simple classes.
+Not supported: `use` referencing non-`path` elements, `symbol`,
+clip paths, masks, filters, patterns, markers, CSS cascade beyond
+simple classes, OpenType features beyond kerning (ligatures, marks),
+CFF (`.otf`) and variable-font outlines, bidi/complex scripts.
 
 Known limitations of the `<use>`/nested-`<svg>` support:
 
@@ -102,12 +110,44 @@ Known limitations of the `<use>`/nested-`<svg>` support:
   to scale 1 instead of the spec default (100% of the parent viewport),
   and the implicit clipping of nested viewports is not applied.
 
+## Text rendering
+
+`<text>`/`<tspan>` elements become glyph-outline shapes placed along
+the baseline with hmtx advances and GPOS kerning, laid out the way
+Pango/HarfBuzz would lay the same string:
+
+- A minimal TrueType reader (`src/nanosvg/font.cr`, no dependencies):
+  `cmap` (formats 4/12), `hmtx`, `loca`/`glyf` (simple + composite
+  glyphs, quadratics elevated to cubics), `hhea`/`OS/2` metrics.
+- Kerning (`font_kern.cr`): the GPOS `kern` feature — PairPos formats
+  1 and 2, class-based and pair-set, extension (type 9) lookups —
+  with the legacy `kern` table as a fallback. Values verified against
+  HarfBuzz (Liberation Sans kern(A,V) = -152, kern(space,A) = -113;
+  DejaVu Sans kern(A,V) = -131; Lato kern(A,V) = -108 — all exact).
+- Families resolve through fontconfig (`fc-match`, the same library
+  Pango uses), so both renderers pick the same font file; explicit
+  registration is available via `NanoSVG::FontStore.register`.
+
+Validated against librsvg on a 100-case dataset
+(`dataset/text/gen.py`, references rendered with hinting disabled so
+both sides rasterize raw outlines): mean |Δα| averages **0.15**
+(0.35 on plain text, worst case 1.72 on `dominant-baseline="middle"`
+where rsvg's metrics differ from ours by ~1px at 32px); 0.33% of
+pixels differ by |Δα|>16 — the antialiasing floor between the NanoSVG
+scanline rasterizer and Cairo/FreeType coverage. Byte identity is not
+expected across different rasterizer algorithms; the residual is edge
+coverage only, not geometry. See `bench/text_pixel_diff.cr`.
+
+When no font can be resolved (no `fc-match`, e.g. headless Windows),
+text elements are skipped silently — the pre-text behavior.
+
 ## Differences from C
 
 - Extended beyond the C original: `<use href="#id">` referencing a
   `<path id>` from `<defs>` (with `x`/`y`, `transform`, and forward
-  references), and nested `<svg>` elements treated as viewport
-  transforms — this is what MathJax SVG output is built on.
+  references), nested `<svg>` elements treated as viewport
+  transforms — this is what MathJax SVG output is built on — and
+  `<text>`/`<tspan>` rendering (see "Text rendering").
 - Colors use the same bit layout as C: `0xAABBGGRR` (R in the low byte).
 - The `NOTE(port)` comments in the sources mark deliberate deviations
   (mostly: C read uninitialized memory in degenerate cases; the port uses

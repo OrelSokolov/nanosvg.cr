@@ -39,6 +39,29 @@ crystal build --release -o bench/build/verify bench/verify.cr
   `name<TAB>w<TAB>h` manifest, for pixel-diffing against a reference
   dataset rasterized by another renderer.
 
+## Text pixel-diff (librsvg oracle)
+
+`dataset/text/` — 100 `<text>` SVGs (families, sizes, weights, italic,
+anchors, dominant-baselines, letter-spacing, transforms, gradients,
+tspans) with reference PNGs rasterized by librsvg with hinting forced
+off (`nohint.conf`), so both renderers rasterize raw glyph outlines.
+
+```sh
+python3 dataset/text/gen.py                       # regenerate cases + refs
+crystal run bench/text_pixel_diff.cr              # full report + worst-case images
+crystal run bench/text_profile.cr -- case_name    # column spans ours vs ref
+crystal run bench/font_smoke.cr                   # TTF reader sanity
+```
+
+Result (mean |Δα|, alpha = glyph coverage): corpus average **0.15**,
+plain-text cases 0.26–0.35, worst 1.72 (`dominant-baseline="middle"`,
+a ~1px rsvg/Pango metric difference); |Δα|>16 share 0.33% average —
+the antialiasing floor between the NanoSVG scanline rasterizer and
+Cairo/FreeType coverage. Not byte-identical by construction: two
+different AA algorithms produce different edge coverage even for
+identical geometry; geometry (glyph positions, advances, kerning)
+matches HarfBuzz exactly.
+
 ## Before optimization (rasterize, min, ms — C / Crystal)
 
 | file        | w=128        | w=512          | w=1024           |
