@@ -165,6 +165,15 @@ module NanoSVG
     property has_stroke : Int32 = 0
     property visible : Bool = true
     property paint_order : UInt8 = 0u8
+    # Text properties (<text>/<tspan>).
+    property font_family : String = "sans-serif"
+    property font_bold : Bool = false
+    property font_italic : Bool = false
+    property letter_spacing : Float32 = 0.0f32
+    # 0 = start, 1 = middle, 2 = end.
+    property text_anchor : Int32 = 0
+    # 0 = alphabetic, 1 = central, 2 = middle, 3 = hanging.
+    property dominant_baseline : Int32 = 0
 
     def initialize
       @paint_order = Parser.encode_paint_order(PAINT_FILL, PAINT_STROKE, PAINT_MARKERS)
@@ -198,6 +207,12 @@ module NanoSVG
       a.has_stroke = @has_stroke
       a.visible = @visible
       a.paint_order = @paint_order
+      a.font_family = @font_family
+      a.font_bold = @font_bold
+      a.font_italic = @font_italic
+      a.letter_spacing = @letter_spacing
+      a.text_anchor = @text_anchor
+      a.dominant_baseline = @dominant_baseline
       a
     end
   end
@@ -260,6 +275,31 @@ module NanoSVG
     # (forward references); resolved after the whole document is read.
     @pending_uses = [] of PendingUse
     @svg_depth = 0
+
+    # <text>/<tspan> state: content accumulates per chunk; chunks are
+    # laid out (glyph outlines placed along the baseline) when </text>
+    # closes. See layout_text_chunks.
+    @in_text = false
+    @text_chunks = [] of TextChunk
+    @text_cur : TextChunk?
+    @text_pen_x = Float32::NAN # user units; NAN until the first chunk
+    @text_pen_y = Float32::NAN
+
+    # One <text>-content run: the character data accumulated between
+    # element boundaries plus the attribute state at that point.
+    private class TextChunk
+      property text : String = ""
+      property attr : Attrib
+      # Position for the chunk start: absolute x/y (when set) or a
+      # relative shift from the current pen position.
+      property x : Float32? = nil
+      property y : Float32? = nil
+      property dx : Float32 = 0.0f32
+      property dy : Float32 = 0.0f32
+
+      def initialize(@attr)
+      end
+    end
 
     def initialize
       @image = Image.new
@@ -1451,6 +1491,32 @@ module NanoSVG
         attr.fill_rule = parse_fill_rule(value)
       when "font-size"
         attr.font_size = parse_coordinate(value, 0.0f32, actual_length)
+      when "font-family"
+        attr.font_family = parse_font_family(value)
+      when "font-weight"
+        attr.font_bold = case value.strip.downcase
+          when "bold", "bolder" then true
+          else value.to_f? ? value.to_f.not_nil! >= 600 : false
+        end
+      when "font-style"
+        v = value.strip.downcase
+        attr.font_italic = v == "italic" || v == "oblique"
+      when "letter-spacing"
+        attr.letter_spacing = parse_coordinate(value, 0.0f32, actual_length)
+      when "text-anchor"
+        case value.strip
+        when "middle" then attr.text_anchor = 1
+        when "end"   then attr.text_anchor = 2
+        else              attr.text_anchor = 0
+        end
+      when "dominant-baseline"
+        case value.strip
+        when "central"        then attr.dominant_baseline = 1
+        when "middle"         then attr.dominant_baseline = 2
+        when "hanging"        then attr.dominant_baseline = 3
+        when "text-top", "top" then attr.dominant_baseline = 3
+        else                       attr.dominant_baseline = 0
+        end
       when "transform"
         t = parse_transform(value)
         attr.xform = xform_premultiply(attr.xform, t)
@@ -2327,6 +2393,220 @@ module NanoSVG
       @image.shapes << shape
     end
 
+    # ---------- <text>/<tspan> ----------
+
+    # Opens a text element (or tspan: a style/position change inside a
+    # running <text>). x/y/dx/dy are captured for the next content run;
+    # everything else flows through the shared attribute stack.
+    private def start_text(attrs : Array(Tuple(String, String)), root : Bool = true)
+      push_attr
+      if root
+        @in_text = true
+        @text_pen_x = @text_pen_y = Float32::NAN
+        @pending_text_x = @pending_text_y = @pending_text_dx = @pending_text_dy = nil
+      end
+      # A tspan only overrides what it sets itself: the <text>'s
+      # pending x/y must survive for content that starts inside a
+      # tspan (e.g. "Red" in <tspan>Red</tspan>).
+      @text_cur = nil
+      @text_pos_fresh = true
+      attrs.each do |name, value|
+        case name
+        when "x"  then set_text_pos_x(value)
+        when "y"  then set_text_pos_y(value)
+        when "dx" then set_text_dx(value)
+        when "dy" then set_text_dy(value)
+        else
+          parse_attr(name, value)
+        end
+      end
+    end
+
+    @pending_text_x : Float32? = nil
+    @pending_text_y : Float32? = nil
+    @pending_text_dx : Float32? = nil
+    @pending_text_dy : Float32? = nil
+    # True until the first position setter of the current element:
+    # repeated x/dx on one element accumulate, across elements they
+    # replace.
+    @text_pos_fresh = true
+
+    private def set_text_pos_x(value : String) : Nil
+      v = parse_coordinate(value, 0.0f32, actual_width)
+      @pending_text_x = v if @text_pos_fresh || @pending_text_x.nil?
+      @pending_text_dx = nil
+      @text_pos_fresh = false
+    end
+
+    private def set_text_pos_y(value : String) : Nil
+      v = parse_coordinate(value, 0.0f32, actual_height)
+      @pending_text_y = v if @text_pos_fresh || @pending_text_y.nil?
+      @pending_text_dy = nil
+      @text_pos_fresh = false
+    end
+
+    private def set_text_dx(value : String) : Nil
+      v = parse_coordinate(value, 0.0f32, actual_width)
+      base = @text_pos_fresh ? nil : @pending_text_dx
+      @pending_text_dx = (base || 0.0f32) + v
+      @text_pos_fresh = false
+    end
+
+    private def set_text_dy(value : String) : Nil
+      v = parse_coordinate(value, 0.0f32, actual_height)
+      base = @text_pos_fresh ? nil : @pending_text_dy
+      @pending_text_dy = (base || 0.0f32) + v
+      @text_pos_fresh = false
+    end
+
+    # Content callback extension: character data inside <text> goes to
+    # the current chunk (created lazily with the attributes and any
+    # pending position captured on the opening tag).
+    private def on_text_content(s : String) : Nil
+      return if s.empty?
+      chunk = @text_cur || begin
+        c = TextChunk.new(get_attr.copy)
+        if px = @pending_text_x
+          c.x = px
+        end
+        if py = @pending_text_y
+          c.y = py
+        end
+        c.dx += @pending_text_dx || 0.0f32
+        c.dy += @pending_text_dy || 0.0f32
+        @pending_text_x = @pending_text_y = nil
+        @pending_text_dx = @pending_text_dy = nil
+        @text_chunks << c
+        @text_cur = c
+        c
+      end
+      chunk.text += s
+    end
+
+    # SVG 1.1 default whitespace processing: newlines/tabs become
+    # spaces, runs of whitespace collapse to one, chunk boundaries
+    # (elements) also break runs.
+    private def normalize_text_chunk(s : String) : String
+      s.gsub(/[\t\n\r ]+/, " ").strip
+    end
+
+    # Places the accumulated chunks: resolves the font, walks glyph by
+    # glyph (advances + GPOS kerning), applies text-anchor and
+    # dominant-baseline, and appends one closed-path Shape per chunk.
+    private def layout_text_chunks : Nil
+      chunks, @text_chunks = @text_chunks, [] of TextChunk
+      @text_pen_x = @text_pen_y = Float32::NAN
+
+      chunks.each do |chunk|
+        text = normalize_text_chunk(chunk.text)
+        if ENV["NSVG_TEXT_DEBUG"]?
+          STDERR.puts "chunk #{text.inspect}: x=#{chunk.x.inspect} y=#{chunk.y.inspect} " \
+                      "dx=#{chunk.dx} dy=#{chunk.dy} size=#{chunk.attr.font_size} fam=#{chunk.attr.font_family}"
+        end
+        next if text.empty?
+
+        attr = chunk.attr
+        font = FontStore.font(attr.font_family, attr.font_bold, attr.font_italic)
+        next unless font
+        size = attr.font_size > 0 ? attr.font_size : 16.0f32
+        scale = size / font.units_per_em.to_f32
+        spacing = attr.letter_spacing
+
+        # Pen start: absolute x/y when set, else chained from the end
+        # of the previous chunk plus this chunk's dx/dy.
+        pen_x = chunk.x ? chunk.x.not_nil! + chunk.dx
+               : (@text_pen_x.nan? ? chunk.dx : @text_pen_x + chunk.dx)
+        pen_y = chunk.y ? chunk.y.not_nil! + chunk.dy
+               : (@text_pen_y.nan? ? chunk.dy : @text_pen_y + chunk.dy)
+
+        # Total advance width for text-anchor.
+        width = 0.0f32
+        prev_gid = -1
+        text.each_char do |chr|
+          gid = font.glyph_index(chr.ord)
+          width += font.advance(gid) * scale
+          width += font.kern(prev_gid, gid) * scale if prev_gid >= 0
+          width += spacing
+          prev_gid = gid
+        end
+
+        case attr.text_anchor
+        when 1 then pen_x -= width * 0.5f32
+        when 2 then pen_x -= width
+        end
+
+        # Baseline shift for dominant-baseline: rsvg/Pango place the
+        # alphabetic baseline BELOW the y line for central/middle (the
+        # y line marks the em-box center / half-x-height point).
+        baseline = case attr.dominant_baseline
+                   when 1 then (font.ascender + font.descender) * 0.5f32 * scale
+                   when 2 then font.x_height * 0.5f32 * scale
+                   when 3 then -font.ascender * 0.8f32 * scale
+                   else        0.0f32
+                   end
+        baseline_y = pen_y + baseline
+
+        paths = [] of Path
+        prev_gid = -1
+        text.each_char do |chr|
+          gid = font.glyph_index(chr.ord)
+          if prev_gid >= 0
+            pen_x += font.kern(prev_gid, gid) * scale
+            pen_x += spacing
+          end
+          if glyph = font.glyph(gid)
+            glyph.contours.each do |contour|
+              path = glyph_path(contour, pen_x, baseline_y, scale, attr.xform)
+              paths << path if path
+            end
+          end
+          pen_x += font.advance(gid) * scale
+          prev_gid = gid
+        end
+
+        unless paths.empty?
+          shape = build_shape(attr, paths)
+          @image.shapes << shape
+        end
+
+        # The next chunk continues after this one, at the same baseline
+        # (baseline shifts are per-chunk).
+        @text_pen_x = pen_x
+        @text_pen_y = pen_y
+      end
+    end
+
+    # One glyph contour (font units, y-down) scaled to the text size,
+    # placed at the pen position and mapped through the accumulated
+    # transform — the same treatment a <path> gets.
+    private def glyph_path(contour : Array(Float32), pen_x : Float32, baseline_y : Float32,
+                           scale : Float32, xform : Array(Float32)) : Path?
+      return nil if contour.size < 8 # need at least one cubic segment
+      p = Path.new
+      p.closed = true
+      i = 0
+      while i < contour.size
+        gx = pen_x + contour[i] * scale
+        gy = baseline_y + contour[i + 1] * scale
+        x, y = xform_point(gx, gy, xform)
+        p.pts << x
+        p.pts << y
+        i += 2
+      end
+      compute_path_bounds(p)
+      p
+    end
+
+    # font-family: first family of the list, unquoted.
+    private def parse_font_family(value : String) : String
+      first = value.split(',')[0]?.try(&.strip) || value.strip
+      first = first.byte_slice(1, first.bytesize - 2) if first.size >= 2 &&
+        ((first.starts_with?('"') && first.ends_with?('"')) ||
+         (first.starts_with?('\'') && first.ends_with?('\'')))
+      first.empty? ? "sans-serif" : first
+    end
+
+
     # Instantiates deferred <use> references whose defs appeared later
     # in the document. Unresolvable references are dropped silently.
     def resolve_pending_uses : Nil
@@ -2462,6 +2742,10 @@ module NanoSVG
         @defs_flag = true
       when "use"
         parse_use(attrs)
+      when "text"
+        start_text(attrs)
+      when "tspan"
+        start_text(attrs, root: false) if @in_text
       when "svg"
         if @svg_depth == 0
           parse_svg(attrs)
@@ -2480,16 +2764,26 @@ module NanoSVG
       when "path"  then @path_flag = false
       when "defs"  then @defs_flag = false
       when "style" then @style_flag = false
+      when "text"
+        @in_text = false
+        @text_cur = nil
+        layout_text_chunks
+        pop_attr
+      when "tspan"
+        @text_cur = nil
+        pop_attr if @in_text
       when "svg"
         @svg_depth -= 1
         pop_attr if @svg_depth > 0
       end
     end
 
-    # Content callback: parses <style> blocks.
+    # Content callback: parses <style> blocks; character data inside
+    # <text> accumulates into the current text chunk.
     # Note: we only support selector lists of simple class selectors
     # (e.g. ".foo, .bar { ... }").
     private def on_content(s : String)
+      on_text_content(s) if @in_text
       i = 0
       size = s.bytesize
       # Trim start white spaces (C nsvg__parseContent)
