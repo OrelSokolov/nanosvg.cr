@@ -106,8 +106,45 @@ module NanoSVG
     #   scale  - image scale
     #   dst    - destination buffer, 4 bytes per pixel (RGBA)
     #   stride - number of bytes per scanline in the destination buffer
+    #
+    # dst is cleared first, so callers may reuse a buffer between calls.
+    # (Bytes.new does NOT guarantee zeroed memory — the GC hands out
+    # recycled pages — so the clear is not optional.)
     def rasterize(image : Image, tx : Float32, ty : Float32, scale : Float32,
                   dst : Bytes, w : Int32, h : Int32, stride : Int32) : Nil
+      rasterize_impl(image, tx, ty, scale, dst, w, h, stride)
+    end
+
+    # Convenience overload: allocates an RGBA buffer of w*h*4
+    # (stride = w*4) and returns it (non-premultiplied alpha).
+    def rasterize(image : Image, tx : Float32, ty : Float32, scale : Float32,
+                  w : Int32, h : Int32) : Bytes
+      dst = Bytes.new(w*h*4)
+      rasterize_impl(image, tx, ty, scale, dst, w, h, w*4)
+      dst
+    end
+
+    # Reusable grow-only output buffer for the one-shot overload below:
+    # a 2048x2048 bake would otherwise hand 16 MB of garbage to the GC on
+    # every call. NOTE: the returned buffer is REUSED by the next one-shot
+    # call — copy it if you need to keep it around (also: not safe to call
+    # from multiple threads concurrently).
+    @@one_shot_buffer : Bytes = Bytes.new(0)
+
+    # One-shot convenience (creates a throwaway rasterizer context).
+    def self.rasterize(image : Image, tx : Float32, ty : Float32, scale : Float32,
+                       w : Int32, h : Int32) : Bytes
+      need = w.to_i64 * h.to_i64 * 4
+      if @@one_shot_buffer.size.to_i64 < need
+        @@one_shot_buffer = Bytes.new(need.to_i32)
+      end
+      dst = @@one_shot_buffer
+      Rasterizer.new.rasterize_impl(image, tx, ty, scale, dst, w, h, w*4)
+      dst[0, need.to_i32]
+    end
+
+    protected def rasterize_impl(image : Image, tx : Float32, ty : Float32, scale : Float32,
+                                 dst : Bytes, w : Int32, h : Int32, stride : Int32) : Nil
       @bitmap = dst
       @width = w
       @height = h
@@ -157,21 +194,6 @@ module NanoSVG
       @width = 0
       @height = 0
       @stride = 0
-    end
-
-    # Convenience overload: allocates an RGBA buffer of w*h*4 (stride = w*4)
-    # and returns it (non-premultiplied alpha).
-    def rasterize(image : Image, tx : Float32, ty : Float32, scale : Float32,
-                  w : Int32, h : Int32) : Bytes
-      dst = Bytes.new(w*h*4)
-      rasterize(image, tx, ty, scale, dst, w, h, w*4)
-      dst
-    end
-
-    # One-shot convenience (creates a throwaway rasterizer context).
-    def self.rasterize(image : Image, tx : Float32, ty : Float32, scale : Float32,
-                       w : Int32, h : Int32) : Bytes
-      Rasterizer.new.rasterize(image, tx, ty, scale, w, h)
     end
 
     # ---------- point/edge accumulation ----------
@@ -988,9 +1010,14 @@ module NanoSVG
         fx = (x.to_f32 - tx) / scale
         fy = (y.to_f32 - ty) / scale
         dx = 1.0f32 / scale
+        # hoisted out of the per-pixel loop (bounds-checked Array fetches)
+        t1 = t[1]
+        t3 = t[3]
+        t5 = t[5]
+        colp = cache.colors.to_unsafe
         count.times do
-          gy = fx*t[1] + fy*t[3] + t[5]
-          c = cache.colors[clampf(gy*255.0f32, 0.0f32, 255.0f32).to_i32]
+          gy = fx*t1 + fy*t3 + t5
+          c = colp[clampf(gy*255.0f32, 0.0f32, 255.0f32).to_i32]
           cr = (c & 0xff).to_i32
           cg = ((c >> 8) & 0xff).to_i32
           cb = ((c >> 16) & 0xff).to_i32
@@ -1017,11 +1044,18 @@ module NanoSVG
         fx = (x.to_f32 - tx) / scale
         fy = (y.to_f32 - ty) / scale
         dx = 1.0f32 / scale
+        t0 = t[0]
+        t1 = t[1]
+        t2 = t[2]
+        t3 = t[3]
+        t4 = t[4]
+        t5 = t[5]
+        colp = cache.colors.to_unsafe
         count.times do
-          gx = fx*t[0] + fy*t[2] + t[4]
-          gy = fx*t[1] + fy*t[3] + t[5]
+          gx = fx*t0 + fy*t2 + t4
+          gy = fx*t1 + fy*t3 + t5
           gd = Math.sqrt((gx*gx + gy*gy).to_f64).to_f32
-          c = cache.colors[clampf(gd*255.0f32, 0.0f32, 255.0f32).to_i32]
+          c = colp[clampf(gd*255.0f32, 0.0f32, 255.0f32).to_i32]
           cr = (c & 0xff).to_i32
           cg = ((c >> 8) & 0xff).to_i32
           cb = ((c >> 16) & 0xff).to_i32
@@ -1193,23 +1227,30 @@ module NanoSVG
 
     private def unpremultiply_alpha(image : Bytes, w : Int32, h : Int32, stride : Int32)
       img = image.to_unsafe
-      # Unpremultiply
-      h.times do |y|
-        w.times do |x|
-          i = y*stride + x*4
+      # Unpremultiply (i walks byte-wise; cheaper than y*stride + x*4 per pixel)
+      y = 0
+      while y < h
+        i = y*stride
+        x = 0
+        while x < w
           a = img[i+3].to_i32
           if a != 0
             img[i] = (img[i].to_i32*255//a).to_u8!
             img[i+1] = (img[i+1].to_i32*255//a).to_u8!
             img[i+2] = (img[i+2].to_i32*255//a).to_u8!
           end
+          i += 4
+          x += 1
         end
+        y += 1
       end
 
       # Defringe
-      h.times do |y|
-        w.times do |x|
-          i = y*stride + x*4
+      y = 0
+      while y < h
+        i = y*stride
+        x = 0
+        while x < w
           r = 0
           g = 0
           b = 0
@@ -1248,7 +1289,10 @@ module NanoSVG
               img[i+2] = (b//n).to_u8!
             end
           end
+          i += 4
+          x += 1
         end
+        y += 1
       end
     end
 

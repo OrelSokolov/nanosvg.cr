@@ -90,6 +90,28 @@ files at all three sizes) and the spec suite passes.
 Parse remains ~1.5–2x slower than C (1.6ms vs ~1.0ms on 23.svg, tens of
 microseconds elsewhere); the parser was not the target here.
 
+## Stage-1 round (rasterizer-10x plan, 2026-10-13)
+
+Interleaved base/opt/C runs (3 rounds each, min; see the ledger in
+`plans/rasterizer-10x.md` for methodology and the full story):
+
+Rasterize (min, ms — base / opt / C):
+
+| file        | w=128                | w=512                 | w=1024                  |
+|-------------|----------------------|-----------------------|-------------------------|
+| nano.svg    | 0.113 / 0.100 / 0.082 | 0.874 / 0.716 / 0.623 | 3.24 / 2.74 / 2.30      |
+| drawing.svg | 0.161 / 0.146 / 0.120 | 1.381 / 1.239 / 1.026 | 4.55 / 4.46 / 3.77      |
+| 23.svg      | 5.09 / 5.49 / 4.22   | 11.51 / 11.67 / 10.25 | 26.02 / 26.34 / 24.76   |
+
+Changes: gradient-loop invariant hoisting (xform/ color-table fetches out
+of the per-pixel loop), a grow-only pooled buffer behind the one-shot
+`Rasterizer.rasterize`, and an incremental pointer walk in
+`unpremultiply_alpha`. Output byte-identical (pixel-level A/B diff against
+the pre-change source on all files/sizes, plus `verify.cr` hashes). A
+UInt64 SWAR blend was tried, proven bit-identical, but ~10–15% slower than
+the byte loop LLVM already vectorizes — reverted. Note: `Bytes.new(n)`
+does NOT guarantee zeroed memory; the rasterize clear is load-bearing.
+
 ## What was changed in the rasterizer (`src/nanosvg/rasterizer.cr`)
 
 1. **Active-edge list → flat pool.** The linked list of heap-allocated
