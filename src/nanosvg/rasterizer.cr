@@ -110,17 +110,25 @@ module NanoSVG
     # dst is cleared first, so callers may reuse a buffer between calls.
     # (Bytes.new does NOT guarantee zeroed memory — the GC hands out
     # recycled pages — so the clear is not optional.)
+    #
+    # premultiplied: true skips the final unpremultiply+defringe pass and
+    # returns RGBA with color channels premultiplied by alpha (the format
+    # the blend loops naturally produce). GPU pipelines that expect
+    # premultiplied textures avoid a full-buffer extra pass this way; the
+    # output then DIFFERS from the C twin's straight-alpha format.
     def rasterize(image : Image, tx : Float32, ty : Float32, scale : Float32,
-                  dst : Bytes, w : Int32, h : Int32, stride : Int32) : Nil
-      rasterize_impl(image, tx, ty, scale, dst, w, h, stride)
+                  dst : Bytes, w : Int32, h : Int32, stride : Int32,
+                  premultiplied : Bool = false) : Nil
+      rasterize_impl(image, tx, ty, scale, dst, w, h, stride, premultiplied)
     end
 
     # Convenience overload: allocates an RGBA buffer of w*h*4
-    # (stride = w*4) and returns it (non-premultiplied alpha).
+    # (stride = w*4) and returns it (non-premultiplied alpha unless
+    # premultiplied: true).
     def rasterize(image : Image, tx : Float32, ty : Float32, scale : Float32,
-                  w : Int32, h : Int32) : Bytes
+                  w : Int32, h : Int32, premultiplied : Bool = false) : Bytes
       dst = Bytes.new(w*h*4)
-      rasterize_impl(image, tx, ty, scale, dst, w, h, w*4)
+      rasterize_impl(image, tx, ty, scale, dst, w, h, w*4, premultiplied)
       dst
     end
 
@@ -133,18 +141,19 @@ module NanoSVG
 
     # One-shot convenience (creates a throwaway rasterizer context).
     def self.rasterize(image : Image, tx : Float32, ty : Float32, scale : Float32,
-                       w : Int32, h : Int32) : Bytes
+                       w : Int32, h : Int32, premultiplied : Bool = false) : Bytes
       need = w.to_i64 * h.to_i64 * 4
       if @@one_shot_buffer.size.to_i64 < need
         @@one_shot_buffer = Bytes.new(need.to_i32)
       end
       dst = @@one_shot_buffer
-      Rasterizer.new.rasterize_impl(image, tx, ty, scale, dst, w, h, w*4)
+      Rasterizer.new.rasterize_impl(image, tx, ty, scale, dst, w, h, w*4, premultiplied)
       dst[0, need.to_i32]
     end
 
     protected def rasterize_impl(image : Image, tx : Float32, ty : Float32, scale : Float32,
-                                 dst : Bytes, w : Int32, h : Int32, stride : Int32) : Nil
+                                 dst : Bytes, w : Int32, h : Int32, stride : Int32,
+                                 premultiplied : Bool = false) : Nil
       @bitmap = dst
       @width = w
       @height = h
@@ -188,7 +197,9 @@ module NanoSVG
         end
       end
 
-      unpremultiply_alpha(dst, w, h, stride)
+      # Stage 2: with premultiplied output the blend result is already in
+      # the requested format — skip the unpremultiply+defringe walk.
+      unpremultiply_alpha(dst, w, h, stride) unless premultiplied
 
       @bitmap = Bytes.new(0)
       @width = 0

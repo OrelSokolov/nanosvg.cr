@@ -61,4 +61,29 @@ describe NanoSVG::Rasterizer do
       px.size.should eq(w*h*4)
     end
   end
+
+  it "premultiplied output matches straight-alpha output scaled by alpha" do
+    svg = %(<svg xmlns="http://www.w3.org/2000/svg" width="30" height="30"><defs><linearGradient id="g"><stop offset="0" stop-color="#102030"/><stop offset="1" stop-color="#f0c090"/></linearGradient></defs><circle cx="15" cy="15" r="12" fill="url(#g)" opacity="0.7"/></svg>)
+    img = NanoSVG.parse(svg)
+    straight = NanoSVG::Rasterizer.rasterize(img, 0.0f32, 0.0f32, 1.0f32, 30, 30).dup
+    pre = NanoSVG::Rasterizer.rasterize(img, 0.0f32, 0.0f32, 1.0f32, 30, 30, premultiplied: true)
+    pre.size.should eq(straight.size)
+    (0...30*30).each do |p|
+      i = p*4
+      a = straight[i+3].to_i32
+      pre[i+3].should eq(a) # alpha is unaffected by premultiplication
+      if a == 0
+        pre[i].should eq(0)
+        pre[i+1].should eq(0)
+        pre[i+2].should eq(0)
+      else
+        3.times do |ch|
+          # straight = floor(premult * 255 / a), so premult is within 1 of
+          # straight * a / 255
+          expected = straight[i+ch].to_i32 * a / 255
+          (pre[i+ch].to_i32 - expected).abs.should be <= 1
+        end
+      end
+    end
+  end
 end

@@ -141,6 +141,67 @@ canvas cares about; 3b is the stretch goal.
 |------|-------|------------------------------|----------------------------|--------|
 | 2026-10-13 | 0 (baseline) | nano 3.24 / drawing 4.55 / 23.svg 26.0 | nano 2.30 / drawing 3.77 / 23.svg 24.8 | green |
 | 2026-10-13 | 1a(hoist)+1c(pool)+1d | nano 2.74 / drawing 4.46 / 23.svg 26.3 | (same) | green |
+| 2026-10-13 | 2 (premultiplied opt-in) | see below | (same) | green (default output unchanged) |
+
+### Stage 2 — premultiplied output (landed as opt-in)
+
+`premultiplied: true` on every `rasterize` overload skips the final
+unpremultiply+defringe walk; the buffer stays in the blend loops'
+natural premultiplied format. Default output byte-identical (verify
+hashes unchanged, spec suite green, new spec cross-checks premult ==
+straight·a/255 ±1 for every pixel).
+
+Why it beat the plan's +25–40% estimate by a mile: on icon art the
+defringe pass over mostly-transparent pixels (4 neighbor probes per
+a==0 pixel) dominated, not the unpremultiply divides.
+
+Rasterize, straight → premultiplied (min, ms):
+
+| file        | w=1024      | w=2048       |
+|-------------|-------------|--------------|
+| nano.svg    | 2.38 → 0.27 | 9.37 → 0.87  |
+| drawing.svg | 3.98 → 1.02 | 15.5 → 3.65  |
+| 23.svg      | 23.2 → 18.9 | 67.6 → 47.9  |
+
+Caveat: premultiplied output is not defringed (edge halos on dark
+backgrounds look slightly harder); consumers that composite straight
+must divide by alpha themselves or keep the default.
+
+### Stage 3a — parallel bucket bakes (verified, host-side to adopt)
+
+`bench/parallel_bake.cr` (-Dpreview_mt): one shared parsed Image, four
+zoom buckets baked concurrently, each fiber with its own Rasterizer +
+buffer. All 60/60 results byte-identical to the single-threaded
+reference — the rasterizer's reads on a shared Image are thread-safe as
+the plan assumed. Wall-clock prewarm (straight bakes, min of 5):
+
+| file        | sequential | parallel |
+|-------------|------------|----------|
+| nano.svg    | 12.1 ms    | 8.97 ms  |
+| drawing.svg | 21.7 ms    | 15.9 ms  |
+| 23.svg      | 107 ms     | 99.0 ms  |
+
+~1.35× on icon art — bounded by the largest bucket plus GC contention,
+not by our code. egui-cr should switch its prewarm to fibers on real
+threads (and pass `premultiplied: true` while it flips the sampler).
+
+### Stage 3b — skipped, per the plan's own criterion
+
+"if Stage 1+2 bring a 2048 bake under ~15 ms, skip 3b": icon-art 2048
+bakes are 0.87 ms (nano) / 3.65 ms (drawing) premultiplied, and even
+straight drawing sits at ~15.5 ms. Band-parallel scan conversion is not
+worth its complexity for this use case.
+
+### Stage 4 — skipped deliberately
+
+- Flatten cache in user units breaks the byte-identity contract with
+  the C twin and demands a one-time, deliberate regeneration of every
+  verify hash plus a corpus re-diff — for a measured ~2% of bake time
+  on icon art (up to ~20% on flatten-heavy 23.svg@128, which is not the
+  zoom-canvas use case). Not worth the contract break now.
+- Tighter active-edge walking: profiling (sample, nano.svg) shows the
+  scan walk is a small share next to paint/defringe — the plan's own
+  "only if it dominates" gate fails.
 
 Stage-1 measurements (macOS, ARM64, 3 interleaved runs, min; `bench_cr_base`
 built from the pre-stage-1 source, so every round ran base/opt/C back to back):
@@ -190,6 +251,6 @@ bench/build/bench_c.c && gcc -O2 -o bench/build/bench_c bench/build/bench_c.c -l
 Stage 1 promised 2.5–4×; reality is ~1.1–1.2× on paint-heavy art and
 neutral elsewhere. The earlier flat-pool round (see bench/README.md)
 already claimed the big wins; the remaining single-thread gap to C is
-codegen quality on loops LLVM already vectorizes. The realistic levers
-left are stage 2 (premultiplied output, +25–40%, contract change) and
-stage 3a (parallel bucket bakes).
+codegen quality on loops LLVM already vectorizes. The ×10 the zoom
+canvas cares about arrived via stage 2 (premultiplied, below) and
+stage 3a (parallel buckets) instead.

@@ -112,6 +112,28 @@ UInt64 SWAR blend was tried, proven bit-identical, but ~10–15% slower than
 the byte loop LLVM already vectorizes — reverted. Note: `Bytes.new(n)`
 does NOT guarantee zeroed memory; the rasterize clear is load-bearing.
 
+## Stage 2 (premultiplied opt-in) and stage 3a (parallel buckets)
+
+`rasterize(..., premultiplied: true)` skips the unpremultiply+defringe
+pass; output is the blend loops' natural premultiplied RGBA. On icon art
+the defringe walk over transparent pixels dominated, so the win exceeds
+the plan's estimate (min, ms):
+
+| file        | w=1024 straight → premult | w=2048 straight → premult |
+|-------------|---------------------------|---------------------------|
+| nano.svg    | 2.38 → 0.27               | 9.37 → 0.87               |
+| drawing.svg | 3.98 → 1.02               | 15.5 → 3.65               |
+| 23.svg      | 23.2 → 18.9               | 67.6 → 47.9               |
+
+Default output unchanged (hashes green); premultiplied output is not
+defringed. Spec cross-checks premult == straight·a/255 ±1 per pixel.
+
+`parallel_bake.cr` (-Dpreview_mt) verifies the stage-3a prewarm shape:
+four zoom buckets baked concurrently off one parsed Image are
+byte-identical to sequential bakes (60/60), prewarm wall-clock
+12.1→9.0 ms (nano), 21.7→15.9 ms (drawing). Full data and the 3b/4 skip
+rationales are in the ledger inside `plans/rasterizer-10x.md`.
+
 ## What was changed in the rasterizer (`src/nanosvg/rasterizer.cr`)
 
 1. **Active-edge list → flat pool.** The linked list of heap-allocated
